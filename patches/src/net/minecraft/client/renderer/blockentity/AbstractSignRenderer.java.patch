@@ -1,0 +1,23 @@
+--- a/net/minecraft/client/renderer/blockentity/AbstractSignRenderer.java
++++ b/net/minecraft/client/renderer/blockentity/AbstractSignRenderer.java
+@@ -9,6 +9,7 @@
+ import net.minecraft.client.renderer.blockentity.state.SignRenderState;
+ import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
+ import net.minecraft.client.renderer.state.level.CameraRenderState;
++import net.minecraft.client.zoom.Zoom;
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.util.ARGB;
+ import net.minecraft.util.FormattedCharSequence;
+@@ -91,8 +92,11 @@
+             return true;
+         }
+ 
++        // Vanilla always shows glow-text outlines while scoping; the zoom key extends the distance by its magnification
++        // (docs/features/ZOOM.md). distanceScale() is exactly 1 when not zoomed.
++        double zoomScale = Zoom.distanceScale();
+         Entity camera = minecraft.getCameraEntity();
+-        return camera != null && camera.distanceToSqr(Vec3.atCenterOf(pos)) < OUTLINE_RENDER_DISTANCE;
++        return camera != null && camera.distanceToSqr(Vec3.atCenterOf(pos)) < OUTLINE_RENDER_DISTANCE * zoomScale * zoomScale;
+     }
+ 
+     public static int getDarkColor(final SignText signText) {

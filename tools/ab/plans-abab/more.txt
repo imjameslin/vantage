@@ -1,0 +1,12 @@
+# Second abab queue (CONTRACT 16.AB): sequential stop, heavy-view preset, converted and existing switchable toggles.
+# Client build/client-abab.jar (main + W1 + switchable FAST_ANIMATE_TICK / FAST_TEXTURE_ANIMATION), bench
+# ABAB_BENCH_JAR=build/bench-abab3.jar.
+# 1. W1 with the sequential stop on (interleaved arms; stops once median2 and gpuMedian are decided).
+abab w1ab-stop-1 build/client-abab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20 --bench-prop abab.segments=24 --bench-prop abab.stop=true --bench-prop abab.stopOn=median2,gpuMedian
+# 2. Heavy-view fixed-yaw preset: A/A, then W1.
+abab abab-aa-heavy-1 build/client-abab.jar --bench-prop abab.toggles=bench.Abab#aaNoop=0|1 --bench-prop abab.preset=heavy --bench-prop abab.segments=24
+abab w1ab-heavy-1 build/client-abab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20 --bench-prop abab.preset=heavy --bench-prop abab.segments=24
+# 3. Converted toggles: the round-5 fast client tick pair, off vs on (shipped default), switched in-session.
+abab tick-ab-s24-1 build/client-abab.jar --bench-prop abab.toggles=net.minecraft.client.multiplayer.ClientLevel#FAST_ANIMATE_TICK=false|true,net.minecraft.client.renderer.texture.TextureAtlas#FAST_TEXTURE_ANIMATION=false|true --bench-prop abab.segments=24
+# 4. An existing switchable toggle: small-write renaming off vs on (shipped default), read per writeToBuffer call.
+abab rename-ab-s24-1 build/client-abab.jar --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalCommandEncoder#RENAME_SMALL_WRITES=false|true --bench-prop abab.segments=24

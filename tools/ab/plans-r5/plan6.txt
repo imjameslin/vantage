@@ -1,0 +1,15 @@
+# Step 5: confirmation scorecard of the decided set (WIN = A + rename + D + pregrow) vs all off
+static r5ab-fin-st-off-1 off
+static r5ab-fin-st-WIN-1 WIN
+static r5ab-fin-st-WIN-2 WIN
+static r5ab-fin-st-off-2 off
+static r5ab-fin-st-off-3 off
+static r5ab-fin-st-WIN-3 WIN
+travel r5ab-fin-tr-WIN-1 WIN
+travel r5ab-fin-tr-off-1 off
+travel r5ab-fin-tr-off-2 off
+travel r5ab-fin-tr-WIN-2 WIN
+travel r5ab-fin-tr-WIN-3 WIN
+travel r5ab-fin-tr-off-3 off
+travel r5ab-fin-tr-off-4 off
+travel r5ab-fin-tr-WIN-4 WIN

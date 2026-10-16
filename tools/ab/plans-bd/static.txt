@@ -1,0 +1,23 @@
+# Default-mode re-baseline (results/BASELINE-DEFAULT.md), static (tools/bench-one.sh: pinned tools/static-options.txt, RD 12, fullscreen, warmup 15 s, 30 s).
+# 5 configs x 4 rounds, interleaved; round 2 = round 1 reversed, round 4 = round 3 reversed (every arm at mean position 2).
+# tools/ab/scorecard_default.py; vanilla OpenGL / Vulkan with SDL_VIDEO_MAC_FULLSCREEN_SPACES=0.
+static bd-st-main-1 main
+static bd-st-vk-1 vk
+static bd-st-r5-1 r5
+static bd-st-gl-1 gl
+static bd-st-r4-1 r4
+static bd-st-r4-2 r4
+static bd-st-gl-2 gl
+static bd-st-r5-2 r5
+static bd-st-vk-2 vk
+static bd-st-main-2 main
+static bd-st-vk-3 vk
+static bd-st-r4-3 r4
+static bd-st-main-3 main
+static bd-st-r5-3 r5
+static bd-st-gl-3 gl
+static bd-st-gl-4 gl
+static bd-st-r5-4 r5
+static bd-st-main-4 main
+static bd-st-r4-4 r4
+static bd-st-vk-4 vk

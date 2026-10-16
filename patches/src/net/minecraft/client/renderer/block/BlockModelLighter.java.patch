@@ -1,0 +1,25 @@
+--- a/net/minecraft/client/renderer/block/BlockModelLighter.java
++++ b/net/minecraft/client/renderer/block/BlockModelLighter.java
+@@ -1,3 +1,5 @@
++// Patched copy of the vanilla 26.3 class (method merge ships vanilla bytecode for every other method). Difference: Cache's
++// getLightCoords / getShadeBrightness read far terrain's per-mesh arrays (LodLighting) instead of the 100-entry maps.
+ package net.minecraft.client.renderer.block;
+ 
+ import com.mojang.blaze3d.vertex.QuadInstance;
+@@ -679,10 +681,16 @@
+         }
+ 
+         public int getLightCoords(final BlockState state, final BlockAndTintGetter level, final BlockPos pos) {
++            if (this.enabled && net.minecraft.client.renderer.chunk.LodLighting.cached(level)) {
++                return LightCoordsUtil.getLightCoords(net.minecraft.client.renderer.chunk.LodLighting.BRIGHTNESS, level, state, pos);
++            }
+             return LightCoordsUtil.getLightCoords(this.enabled ? this.cachedBrightnessGetter : LightCoordsUtil.BrightnessGetter.DEFAULT, level, state, pos);
+         }
+ 
+         public float getShadeBrightness(final BlockState state, final BlockAndTintGetter level, final BlockPos pos) {
++            if (this.enabled && net.minecraft.client.renderer.chunk.LodLighting.cached(level)) {
++                return net.minecraft.client.renderer.chunk.LodLighting.shade(state, level, pos);
++            }
+             long key = pos.asLong();
+             if (this.enabled) {
+                 float cached = this.brightnessCache.get(key);

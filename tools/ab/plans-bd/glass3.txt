@@ -1,0 +1,4 @@
+# On-glass diagnosis (results/BASELINE-DEFAULT.md): is the vertical mirror of present fusion (CONTRACT 16.3) what keeps the
+# layer composited? Same as glass2 with MCMTL_PRESENT_FUSION=0 (layer untouched, M1/M2 present pass), then the default again.
+static bd-glass-nofuse-1 glass --opt renderDistance:16 --env MCMTL_PRESENT_FUSION=0 --env MCMTL_GLASS_TRACE=1 --env MCMTL_GLASS_TRACE_OUT=bd-glass-nofuse-1.glass.csv
+static bd-glass-5 glass --opt renderDistance:16 --env MCMTL_GLASS_TRACE=1 --env MCMTL_GLASS_TRACE_OUT=bd-glass-5.glass.csv

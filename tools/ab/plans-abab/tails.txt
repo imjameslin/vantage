@@ -1,0 +1,5 @@
+# Third abab queue (CONTRACT 16.AB): tail metrics with one arm per block (segments=1), after the W1 runs showed
+# interleaved arms (segments=24) reporting a smaller 1% low gain than per-spin arms. Client build/client-abab.jar,
+# ABAB_BENCH_JAR=build/bench-abab3.jar.
+abab w1ab-heavy-s1-1 build/client-abab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20 --bench-prop abab.preset=heavy
+abab tick-ab-s1-1 build/client-abab.jar --bench-prop abab.toggles=net.minecraft.client.multiplayer.ClientLevel#FAST_ANIMATE_TICK=false|true,net.minecraft.client.renderer.texture.TextureAtlas#FAST_TEXTURE_ANIMATION=false|true

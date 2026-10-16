@@ -1,0 +1,7 @@
+# Round 9 diagnostics 1 (build/client-r9d1.jar): store actions and the terrain fragment stage, median view (yaw 232.5).
+abab d1-colorstore build/client-r9d1.jar --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalDiag#flags=0|1 --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab d1-depthstore build/client-r9d1.jar --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalDiag#flags=0|2 --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab d1-const-all build/client-r9d1.jar --jvm=-Dmcmetal.terrainVariant=const --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.TerrainShaderVariants#useVariant=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab d1-const-solid build/client-r9d1.jar --jvm=-Dmcmetal.terrainVariant=const --jvm=-Dmcmetal.terrainVariant.pipelines=solid --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.TerrainShaderVariants#useVariant=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab d1-nofog-all build/client-r9d1.jar --jvm=-Dmcmetal.terrainVariant=nofog --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.TerrainShaderVariants#useVariant=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab d1-flat-all build/client-r9d1.jar --jvm=-Dmcmetal.terrainVariant=flat --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.TerrainShaderVariants#useVariant=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5

@@ -1,0 +1,29 @@
+--- a/assets/minecraft/shaders/core/clouds.vsh
++++ b/assets/minecraft/shaders/core/clouds.vsh
+@@ -21,7 +21,14 @@
+ 
+ layout(location = 0) out float vertexDistance;
+ layout(location = 1) out vec4 vertexColor;
++#ifdef TESSERA
++layout(location = 2) out vec3 tesseraCloudPos;
++layout(location = 3) flat out vec3 tesseraCloudNormal;
++layout(location = 4) out vec3 tesseraCloudCell;
+ 
++const vec3[] tesseraFaceNormals = vec3[](vec3(0, -1, 0), vec3(0, 1, 0), vec3(0, 0, -1), vec3(0, 0, 1), vec3(-1, 0, 0), vec3(1, 0, 0));
++#endif
++
+ /*
+ // vertex function below should generate vec3s matching the indices in this array, but using less constants
+ const vec3[] vertices = vec3[](
+@@ -103,4 +110,11 @@
+ 
+     vertexDistance = fog_spherical_distance(pos);
+     vertexColor = (useTopColor ? faceColors[1] : faceColors[direction]) * CloudColor;
++#ifdef TESSERA
++    // Stage 4 (Tessera): the fragment shader lights the face itself (vanilla's fixed face shades become the sun term).
++    tesseraCloudPos = pos;
++    tesseraCloudCell = faceVertex;
++    tesseraCloudNormal = useTopColor ? vec3(0, 1, 0) : tesseraFaceNormals[direction] * (isInsideFace ? -1.0 : 1.0);
++    vertexColor = CloudColor;
++#endif
+ }

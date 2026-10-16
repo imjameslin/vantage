@@ -1,0 +1,10 @@
+# Round 12 screen 3 (build/client-r12c.jar): (a) clusters replicated + attribution (no GPU tests: draw consolidation only),
+# (b) fan quad order on top of the cluster draw, Part B greedy meshing (prototype) exact / aggressive.
+abab s12-cl-spin2 build/client-r12c.jar --jvm=-Dmc.terrain.clusters=true --jvm=-Dmc.terrain.clusters.stats=10 --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainClusters#enabled=false|true
+abab s12-clnocull-spin build/client-r12c.jar --jvm=-Dmc.terrain.clusters=true --jvm=-Dmc.terrain.clusters.cullMask=0 --jvm=-Dmc.terrain.clusters.stats=10 --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainClusters#enabled=false|true
+abab s12-clqio-spin build/client-r12c.jar --jvm=-Dmc.terrain.clusters=true --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainToggles#quadIndexOrder=0|1
+abab s12-clqio-y232 build/client-r12c.jar --jvm=-Dmc.terrain.clusters=true --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainToggles#quadIndexOrder=0|1 --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab s12-gx-spin build/client-r12c.jar --jvm=-Dmc.terrain.greedy=exact --jvm=-Dmc.terrain.meshStats=20 --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainGreedy#draw=false|true
+abab s12-ga-spin build/client-r12c.jar --jvm=-Dmc.terrain.greedy=aggressive --jvm=-Dmc.terrain.meshStats=20 --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainGreedy#draw=false|true
+abab s12-gx-heavy build/client-r12c.jar --jvm=-Dmc.terrain.greedy=exact --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainGreedy#draw=false|true --bench-prop abab.preset=heavy
+abab s12-ga-heavy build/client-r12c.jar --jvm=-Dmc.terrain.greedy=aggressive --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainGreedy#draw=false|true --bench-prop abab.preset=heavy

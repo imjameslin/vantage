@@ -1,0 +1,102 @@
+--- a/net/minecraft/client/renderer/DynamicGpuData.java
++++ b/net/minecraft/client/renderer/DynamicGpuData.java
+@@ -1,3 +1,8 @@
++// Patched copy of the vanilla 26.3 class (render-thread CPU work, docs/stage2/TERRAIN-PLAN.md S4). Differences from vanilla:
++//  - writeChunkSectionCommandsRaw / writeChunkSectionsInstancedRaw: the same storages, sizes, ring offsets and bytes as
++//    writeChunkSectionCommands / writeChunkSectionsInstanced, but the payload is written by a RawWriter in one bulk copy
++//    instead of one record object (and one write() call) per draw / section (used by TerrainDrawList).
++//  - presizeChunkSections (TASK E pregrow, default on since round 5): capacity of the indirect / instanced storages from the render distance.
+ package net.minecraft.client.renderer;
+ 
+ import com.mojang.blaze3d.buffers.Std140Builder;
+@@ -25,6 +30,8 @@
+     private final DynamicGpuDataStorageMapped<DynamicGpuData.TerrainTransform> terrain;
+     private @Nullable DynamicGpuDataStorage<DynamicGpuData.ChunkSectionInfo> chunkSections = null;
+     private @Nullable DynamicGpuDataStorageMapped<DynamicGpuData.IndexedDraw> chunkSectionsCommandBuffer = null;
++    /** TASK E pregrow: capacity the indirect command / instanced section storages are created with (0 = vanilla's 2). */
++    private int chunkSectionsPresize;
+ 
+     public DynamicGpuData() {
+         this.transforms = new DynamicGpuDataStorageMapped<>("Dynamic Transforms UBO", TRANSFORM_UBO_SIZE, 128, 2);
+@@ -104,7 +111,7 @@
+         }
+ 
+         if (this.chunkSections == null) {
+-            this.chunkSections = new DynamicGpuDataStorageNonMapped<>("Chunk Sections Instanced", CHUNK_SECTION_UBO_SIZE, 32, 2);
++            this.chunkSections = new DynamicGpuDataStorageNonMapped<>("Chunk Sections Instanced", CHUNK_SECTION_UBO_SIZE, 32, Math.max(2, this.chunkSectionsPresize));
+         }
+ 
+         return this.chunkSections.writeDataBatched(infos);
+@@ -112,12 +119,71 @@
+ 
+     public GpuBufferSlice[] writeChunkSectionCommands(final List<List<DynamicGpuData.IndexedDraw>> draws) {
+         if (this.chunkSectionsCommandBuffer == null) {
+-            this.chunkSectionsCommandBuffer = new DynamicGpuDataStorageMapped<>("Chunk Sections Command Buffer", 20, 512, 2);
++            this.chunkSectionsCommandBuffer = new DynamicGpuDataStorageMapped<>("Chunk Sections Command Buffer", 20, 512, Math.max(2, this.chunkSectionsPresize));
+         }
+ 
+         return this.chunkSectionsCommandBuffer.writeDataBatchedMultiple(draws);
+     }
+ 
++    /**
++     * {@link #writeChunkSectionsInstanced} for {@code count} section infos written by {@code writer}: 16 bytes each
++     * ({@code x, y, z} ints and the visibility float, as {@link ChunkSectionInfo#write}), in the buffer's byte order.
++     */
++    public GpuBufferSlice writeChunkSectionsInstancedRaw(final int count, final DynamicGpuData.RawWriter writer) {
++        if (this.chunkSections != null && (this.chunkSections.usage() & 32) == 0) {
++            this.chunkSections.close();
++            this.chunkSections = null;
++        }
++
++        if (this.chunkSections == null) {
++            this.chunkSections = new DynamicGpuDataStorageNonMapped<>("Chunk Sections Instanced", CHUNK_SECTION_UBO_SIZE, 32, Math.max(2, this.chunkSectionsPresize));
++        }
++
++        return ((DynamicGpuDataStorageNonMapped<DynamicGpuData.ChunkSectionInfo>)this.chunkSections).writeRawBatched(count, writer);
++    }
++
++    /**
++     * {@link #writeChunkSectionCommands} for {@code listCount} lists of {@code counts[i]} records written by {@code writer}
++     * in list order: 20 bytes each ({@code indexCount, instanceCount, firstIndex, baseVertex, baseInstance}, as
++     * {@link IndexedDraw#write}), in the buffer's byte order.
++     */
++    public GpuBufferSlice[] writeChunkSectionCommandsRaw(final int[] counts, final int listCount, final DynamicGpuData.RawWriter writer) {
++        if (this.chunkSectionsCommandBuffer == null) {
++            this.chunkSectionsCommandBuffer = new DynamicGpuDataStorageMapped<>("Chunk Sections Command Buffer", 20, 512, Math.max(2, this.chunkSectionsPresize));
++        }
++
++        return this.chunkSectionsCommandBuffer.writeRawBatchedMultiple(counts, listCount, writer);
++    }
++
++    /**
++     * TASK E pregrow (-Dmc.terrain.pregrow, LevelRenderer at world join / render-distance change, render thread): the
++     * multi-draw-indirect command ring and the instanced section-info storage get room for
++     * {@code mc.terrain.pregrowDrawsPerColumn * (2 rd + 1)^2} records now (and when they are created later), instead of
++     * doubling inside a frame ("Resizing Chunk Sections Command Buffer 2048 -> 4096"). Only capacity changes: every frame
++     * still writes from offset 0 with the same bytes, and a frame that needs more still grows as vanilla does.
++     */
++    public void presizeChunkSections(final int renderDistance) {
++        long columns = (2L * renderDistance + 1L) * (2L * renderDistance + 1L);
++        int records = (int)Math.min(columns * net.minecraft.client.renderer.chunk.TravelHitchToggles.PREGROW_DRAWS_PER_COLUMN, 1 << 22);
++        this.chunkSectionsPresize = records;
++        if (this.chunkSectionsCommandBuffer != null) {
++            this.chunkSectionsCommandBuffer.ensureCapacity(records);
++        }
++
++        if (this.chunkSections instanceof DynamicGpuDataStorageNonMapped<DynamicGpuData.ChunkSectionInfo> instanced) {
++            instanced.ensureCapacity(records);
++        }
++    }
++
++    /**
++     * Writes a whole batch at the target's position with relative puts (exactly the element count times the block size
++     * the call was made for); the target keeps the byte order of the mapping / staging buffer.
++     */
++    @FunctionalInterface
++    public interface RawWriter {
++        void write(ByteBuffer target);
++    }
++
+     public record ChunkSectionInfo(int x, int y, int z, float visibility) implements DynamicGpuDataStorage.DynamicGpuData {
+         @Override
+         public void write(final ByteBuffer buffer) {

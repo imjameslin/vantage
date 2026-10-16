@@ -1,0 +1,257 @@
+--- a/net/minecraft/client/renderer/extract/LevelExtractor.java
++++ b/net/minecraft/client/renderer/extract/LevelExtractor.java
+@@ -1,5 +1,6 @@
+ package net.minecraft.client.renderer.extract;
+ 
++import com.mojang.blaze3d.systems.RenderSystem;
+ import com.mojang.blaze3d.vertex.PoseStack;
+ import it.unimi.dsi.fastutil.longs.LongCollection;
+ import it.unimi.dsi.fastutil.longs.Long2ObjectMap.Entry;
+@@ -40,12 +41,15 @@
+ import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
+ import net.minecraft.client.renderer.state.level.BlockBreakingRenderState;
+ import net.minecraft.client.renderer.state.level.BlockOutlineRenderState;
++import net.minecraft.client.renderer.state.level.CameraRenderState;
+ import net.minecraft.client.renderer.state.level.LevelRenderState;
+ import net.minecraft.client.renderer.state.level.PlayerRenderState;
+ import net.minecraft.client.renderer.state.level.SectionUpdateRenderState;
+ import net.minecraft.client.renderer.state.level.TransientBlockRenderState;
+ import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+ import net.minecraft.client.server.IntegratedServer;
++import net.minecraft.client.zoom.Zoom;
++import net.minecraft.client.zoom.ZoomMath;
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.core.SectionPos;
+ import net.minecraft.gizmos.Gizmos;
+@@ -77,6 +81,8 @@
+ import net.minecraft.world.phys.Vec3;
+ import net.minecraft.world.phys.shapes.CollisionContext;
+ import net.minecraft.world.phys.shapes.VoxelShape;
++import org.joml.Matrix4f;
++import org.joml.Vector3fc;
+ import org.joml.Vector4fc;
+ import org.jspecify.annotations.Nullable;
+ 
+@@ -96,6 +102,10 @@
+     private int lastViewDistance = -1;
+     private boolean shouldInvalidateCompiledGeometry;
+     private boolean shouldResetLevelRenderData;
++    // Zoom culling pyramid scratch (docs/features/ZOOM.md), reused every zoomed frame.
++    private final double[] zoomCullPyramid = new double[3];
++    private final Matrix4f zoomCullView = new Matrix4f();
++    private final Matrix4f zoomCullProjection = new Matrix4f();
+     private boolean shouldResetChunkLayerSampler;
+     private boolean shouldResetSkyRenderer;
+ 
+@@ -174,6 +184,7 @@
+                         section.sectionMesh.get() != CompiledSectionMesh.UNCOMPILED
+                             || this.sectionUpdateTracker.hasAllNeighbors(this.level, section.getSectionNode())
+                     )) {
++                    long regionStart = net.minecraft.client.renderer.chunk.ChunkStats.ENABLED ? System.nanoTime() : 0L;
+                     this.levelRenderState
+                         .sectionUpdateRenderStates
+                         .add(
+@@ -181,15 +192,24 @@
+                                 section.getSectionNode(), dirtyState.isDirtyFromPlayer(), cache.createRegion(this.level, section.getSectionNode())
+                             )
+                         );
++                    if (net.minecraft.client.renderer.chunk.ChunkStats.ENABLED) {
++                        net.minecraft.client.renderer.chunk.ChunkStats.add(net.minecraft.client.renderer.chunk.ChunkStats.REGION_NS, System.nanoTime() - regionStart);
++                    }
++
+                     dirtyState.setNotDirty();
+                 }
+             }
+         }
+ 
+         profiler.popPush("entities");
++        // Zoom (docs/features/ZOOM.md): objects that only the zoom-aware distance scale brings in must also be inside the
++        // zoomed view; null when not zoomed (vanilla). Read by extractVisibleEntities and BlockEntityRenderer.
++        Frustum zoomFrustum = Zoom.distanceScale() > 1.0 ? this.zoomExtraRangeFrustum(camera, cullFrustum) : null;
++        Zoom.setExtraRangeFrustum(zoomFrustum);
+         this.extractVisibleEntities(camera, cullFrustum, deltaTracker, this.levelRenderState);
+         profiler.popPush("blockEntities");
+         this.extractVisibleBlockEntities(camera, worldPartialTicks, this.levelRenderState);
++        Zoom.setExtraRangeFrustum(null);
+         profiler.popPush("blockOutline");
+         this.extractBlockOutline(camera, this.levelRenderState);
+         profiler.popPush("blockBreaking");
+@@ -258,20 +278,34 @@
+         }
+     }
+ 
++    // Vanilla's signature (Fabric mixins name it; docs/metal/CONTRACT.md 16.FAB): the zoom frustum comes from Zoom, set just
++    // before the call in extract().
+     private void extractVisibleEntities(final Camera camera, final Frustum frustum, final DeltaTracker deltaTracker, final LevelRenderState output) {
++        final @Nullable Frustum zoomFrustum = Zoom.extraRangeFrustum();
+         Vec3 cameraPos = camera.position();
+         double camX = cameraPos.x();
+         double camY = cameraPos.y();
+         double camZ = cameraPos.z();
+         TickRateManager tickRateManager = this.minecraft.level.tickRateManager();
+-        Entity.setViewScale(
+-            Mth.clamp(this.minecraft.options.getEffectiveRenderDistance() / 8.0, 1.0, 2.5) * this.minecraft.options.entityDistanceScaling().get()
+-        );
++        double viewScale = Mth.clamp(this.minecraft.options.getEffectiveRenderDistance() / 8.0, 1.0, 2.5)
++            * this.minecraft.options.entityDistanceScaling().get();
++        Entity.setViewScale(viewScale);
++        // Zoom-aware entity distance (docs/features/ZOOM.md): an entity vanilla culls by distance is still drawn while the
++        // zoom key or a spyglass magnifies it, if it passes the distance check scaled by the on-screen magnification and
++        // is inside the zoomed view. Null (not zoomed): exactly vanilla.
++        double zoomViewScale = viewScale * Zoom.distanceScale();
+         long chunkFadeDuration = Util.toMillis(this.minecraft.options.chunkSectionFadeInTime().get());
+ 
+         for (Entity entity : this.level.entitiesForRendering()) {
+             float entityPartialTicks = deltaTracker.getGameTimeDeltaPartialTick(!tickRateManager.isEntityFrozen(entity));
+-            if (this.isEntityVisible(entity, frustum, camX, camY, camZ, entityPartialTicks, chunkFadeDuration)
++            boolean visible = this.isEntityVisible(entity, frustum, camX, camY, camZ, entityPartialTicks, chunkFadeDuration);
++            if (!visible && zoomFrustum != null) {
++                Entity.setViewScale(zoomViewScale);
++                visible = this.isEntityVisible(entity, zoomFrustum, camX, camY, camZ, entityPartialTicks, chunkFadeDuration);
++                Entity.setViewScale(viewScale);
++            }
++
++            if (visible
+                 && (entity != camera.entity() || camera.isDetached() || camera.entity() instanceof LivingEntity && ((LivingEntity)camera.entity()).isSleeping())
+                 && (!(entity instanceof LocalPlayer) || camera.entity() == entity)) {
+                 if (entity.tickCount == 0) {
+@@ -312,6 +346,69 @@
+         return this.levelRenderer.entityRenderDispatcher().extractEntity(entity, partialTickTime);
+     }
+ 
++    /**
++     * Zoom (docs/features/ZOOM.md): the frustum that entities / block entities brought in only by the zoom-aware
++     * distance scale must pass. Normally the view actually on screen ({@code camera.getFov()}, the zoomed projection's
++     * FOV) padded for this frame's view bob ({@link ZoomMath#cullPyramid}); vanilla's wide culling frustum when the
++     * view is distorted beyond that (hurt tilt, death roll, nausea / portal warp), the frustum is frozen (debug) or the
++     * padded view would not be narrower; null (no extra range at all) for panoramic screenshots.
++     */
++    private @Nullable Frustum zoomExtraRangeFrustum(final Camera camera, final Frustum cullFrustum) {
++        CameraRenderState cameraState = this.levelRenderState.cameraRenderState;
++        if (cameraState.isPanoramicMode) {
++            return null;
++        }
++
++        if (camera.getCapturedFrustum() != null) {
++            return cullFrustum;
++        }
++
++        // GameRenderer.bobHurt / the nausea and portal warp turn or skew the projection far more than view bob: keep the
++        // wide frustum while they act (short, rare).
++        if (cameraState.entityRenderState.isLiving && (cameraState.entityRenderState.isDeadOrDying || cameraState.entityRenderState.hurtTime > 0.0F)) {
++            return cullFrustum;
++        }
++
++        PlayerRenderState playerState = this.levelRenderState.playerRenderState;
++        float screenEffectScale = this.minecraft.options.screenEffectScale().get().floatValue();
++        if (Math.max(playerState.portalEffectIntensity, playerState.nauseaEffectIntensity) * screenEffectScale * screenEffectScale > 0.0F) {
++            return cullFrustum;
++        }
++
++        float width = this.minecraft.getWindow().getWidth();
++        float height = this.minecraft.getWindow().getHeight();
++        double bob = this.minecraft.options.bobView().get() && cameraState.entityRenderState.isPlayer ? cameraState.entityRenderState.bob : 0.0;
++        double[] pyramid = this.zoomCullPyramid;
++        if (!ZoomMath.cullPyramid(camera.getFov(), (double)width / height, bob, pyramid)) {
++            return cullFrustum;
++        }
++
++        double tanX = pyramid[0];
++        double tanY = pyramid[1];
++        double setback = pyramid[2];
++        // Vanilla's culling frustum: FOV max(fov, option fov) (Camera.createProjectionMatrixForCulling).
++        double cullTanY = Math.tan(Math.toRadians(Math.max(camera.getFov(), this.minecraft.options.fov().get().intValue())) * 0.5);
++        if (!(tanY < cullTanY) || !(tanX < cullTanY * width / height)) {
++            return cullFrustum;
++        }
++
++        float depthFar = cameraState.depthFar;
++        this.zoomCullProjection
++            .identity()
++            .perspective(
++                (float)(2.0 * Math.atan(tanY)),
++                (float)(tanX / tanY),
++                0.05F,
++                depthFar + (float)setback,
++                RenderSystem.getDevice().getDeviceInfo().isZZeroToOne()
++            );
++        Frustum frustum = new Frustum(camera.getViewRotationMatrix(this.zoomCullView), this.zoomCullProjection);
++        Vec3 pos = camera.position();
++        Vector3fc forward = camera.forwardVector();
++        frustum.prepare(pos.x - forward.x() * setback, pos.y - forward.y() * setback, pos.z - forward.z() * setback);
++        return frustum;
++    }
++
+     private void extractVisibleBlockEntities(final Camera camera, final float deltaPartialTick, final LevelRenderState levelRenderState) {
+         Vec3 cameraPos = camera.position();
+         double camX = cameraPos.x();
+@@ -533,6 +630,14 @@
+         this.gameTestBlockHighlightRenderer.clear();
+     }
+ 
++    /**
++     * Stage-2 W7 (UiTransitions.terrainShown): true from allChanged() until the next extract has rebuilt the section storage
++     * (LevelRenderer.invalidateCompiledGeometry). Read-only.
++     */
++    public boolean isGeometryInvalidationPending() {
++        return this.shouldInvalidateCompiledGeometry;
++    }
++
+     public void allChanged() {
+         if (this.level != null) {
+             this.level.clearTintCaches();
+@@ -555,6 +660,10 @@
+     }
+ 
+     private void setBlockDirty(final BlockPos pos, final boolean playerChanged) {
++        if (net.minecraft.client.renderer.chunk.ChunkStats.ENABLED && net.minecraft.client.renderer.chunk.ChunkStats.source == net.minecraft.client.renderer.chunk.ChunkStats.SRC_OTHER) {
++            net.minecraft.client.renderer.chunk.ChunkStats.source = net.minecraft.client.renderer.chunk.ChunkStats.SRC_BLOCK;
++        }
++
+         for (int z = pos.getZ() - 1; z <= pos.getZ() + 1; z++) {
+             for (int x = pos.getX() - 1; x <= pos.getX() + 1; x++) {
+                 for (int y = pos.getY() - 1; y <= pos.getY() + 1; y++) {
+@@ -562,9 +671,17 @@
+                 }
+             }
+         }
++
++        if (net.minecraft.client.renderer.chunk.ChunkStats.ENABLED && net.minecraft.client.renderer.chunk.ChunkStats.source == net.minecraft.client.renderer.chunk.ChunkStats.SRC_BLOCK) {
++            net.minecraft.client.renderer.chunk.ChunkStats.source = net.minecraft.client.renderer.chunk.ChunkStats.SRC_OTHER;
++        }
+     }
+ 
+     public void setBlocksDirty(final int x0, final int y0, final int z0, final int x1, final int y1, final int z1) {
++        if (net.minecraft.client.renderer.chunk.ChunkStats.ENABLED) {
++            net.minecraft.client.renderer.chunk.ChunkStats.source = net.minecraft.client.renderer.chunk.ChunkStats.SRC_BLOCK;
++        }
++
+         for (int z = z0 - 1; z <= z1 + 1; z++) {
+             for (int x = x0 - 1; x <= x1 + 1; x++) {
+                 for (int y = y0 - 1; y <= y1 + 1; y++) {
+@@ -572,6 +689,10 @@
+                 }
+             }
+         }
++
++        if (net.minecraft.client.renderer.chunk.ChunkStats.ENABLED) {
++            net.minecraft.client.renderer.chunk.ChunkStats.source = net.minecraft.client.renderer.chunk.ChunkStats.SRC_OTHER;
++        }
+     }
+ 
+     public void setBlockDirty(final BlockPos pos, final BlockState oldState, final BlockState newState) {
+@@ -601,6 +722,14 @@
+     }
+ 
+     private void setSectionDirty(final int sectionX, final int sectionY, final int sectionZ, final boolean playerChanged) {
++        if (net.minecraft.client.renderer.chunk.ChunkStats.ENABLED) {
++            long node = SectionPos.asLong(sectionX, sectionY, sectionZ);
++            SectionUpdateTracker.SectionDirtyState state = this.sectionUpdateTracker.getDirtyState(node);
++            if (state != null && state.getSectionNode() == node) {
++                net.minecraft.client.renderer.chunk.ChunkStats.mark(node, state.isDirty());
++            }
++        }
++
+         this.sectionUpdateTracker.setDirty(sectionX, sectionY, sectionZ, playerChanged);
+     }
+ 

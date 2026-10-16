@@ -1,0 +1,10 @@
+{
+  "options.graphicsApi.metal": "Metal",
+  "key.zoom": "Zoom",
+  "options.farsightQuality": "Far Terrain Quality",
+  "options.renderScale": "Render Scale",
+  "options.farsight": "Far Terrain",
+  "options.farsight.tooltip": "Farsight: low-detail terrain far past your render distance. Takes effect after restarting the game.",
+  "options.tesseraShaders": "Shaders",
+  "options.tesseraShaders.tooltip": "Built-in shaders: shadows, soft clouds, god rays, water reflections, bloom. Takes effect after restarting the game."
+}

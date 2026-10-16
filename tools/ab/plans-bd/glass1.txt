@@ -1,0 +1,3 @@
+# On-glass check (results/BASELINE-DEFAULT.md): main + MCMTL_GLASS_TRACE (build/client-bd-glass.jar) in the user's setup
+# (fullscreen non-Spaces, RD 16, vsync off), static spin: distinct presentedTime values per second, didComposite per present.
+static bd-glass-1 glass --opt renderDistance:16 --env MCMTL_GLASS_TRACE=1 --env MCMTL_GLASS_TRACE_OUT=bd-glass-1.glass.csv

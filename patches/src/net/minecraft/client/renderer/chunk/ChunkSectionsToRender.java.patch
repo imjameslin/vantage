@@ -1,0 +1,404 @@
+--- a/net/minecraft/client/renderer/chunk/ChunkSectionsToRender.java
++++ b/net/minecraft/client/renderer/chunk/ChunkSectionsToRender.java
+@@ -1,3 +1,9 @@
++// Patched copy of the vanilla 26.3 class (stage-2 terrain, docs/stage2/TERRAIN-PLAN.md S1b). Differences from vanilla:
++//  - withTerrainQuadIndexBuffer(): an optional fixed 16-bit quad index buffer replaces the shared sequential quad
++//    buffer as the default index buffer of terrain draws (draws with their own sorted index buffer are unchanged).
++//  - S5 compact vertices: a GpuMultiDrawIndexedIndirect group (DrawIndirect) or a separate draw list (DrawSeparate) of
++//    16-byte TerrainCompact section-layers is drawn with the compact variant of the layer's (or the wireframe override's)
++//    pipeline, RenderPipelines.compactTerrainVariant. Without compact draws the calls are exactly vanilla's.
+ package net.minecraft.client.renderer.chunk;
+ 
+ import com.mojang.blaze3d.systems.RenderSystem;
+@@ -24,12 +30,39 @@
+ public abstract class ChunkSectionsToRender {
+     private final int maxIndicesRequired;
+     private final GpuBufferSlice terrainTransformUBO;
++    private @Nullable GpuBuffer terrainQuadIndexBuffer;
+ 
++    /** Separate targets must be prepared before opening the main pass. */
++    public final void prepareLodReuse(boolean override, GpuSampler sampler, GpuTextureView atlas,
++                                     com.mojang.blaze3d.pipeline.RenderTarget main) {
++        if (!(this instanceof DrawIndirect indirect)) return;
++        if (!override && indirect.lodDraws != null) LodAsync.preparePrograms(indirect);
++        if (!override && indirect.lodDraws != null && indirect.lodAsyncProbe != null) {
++            indirect.lodAsyncProbe.prepare(indirect, this.terrainTransformUBO, sampler, atlas,
++                net.minecraft.client.renderer.Tessera.terrainLightmap(Minecraft.getInstance().gameRenderer.lightmap()), main);
++            if(indirect.lodAsyncProbe.consuming()) return;
++        }
++        if (indirect.lodReuse == null) return;
++        if (override) { indirect.lodReuse.invalidate(); return; }
++        indirect.lodReuse.prepare(indirect, this.terrainTransformUBO, sampler, atlas,
++            net.minecraft.client.renderer.Tessera.terrainLightmap(Minecraft.getInstance().gameRenderer.lightmap()), main);
++    }
++
+     private ChunkSectionsToRender(final GpuBufferSlice terrainTransformUBO, final int maxIndicesRequired) {
+         this.maxIndicesRequired = maxIndicesRequired;
+         this.terrainTransformUBO = terrainTransformUBO;
+     }
+ 
++    /**
++     * Stage-2 terrain patch (S1b, docs/stage2/TERRAIN-PLAN.md): draws without their own index buffer use this fixed
++     * 16-bit quad index buffer ({@code TerrainRuns.SHORT_INDEX_QUADS} quads; the draw list was split to fit) instead
++     * of the shared sequential quad buffer. Null keeps the vanilla shared buffer.
++     */
++    public ChunkSectionsToRender withTerrainQuadIndexBuffer(final @Nullable GpuBuffer terrainQuadIndexBuffer) {
++        this.terrainQuadIndexBuffer = terrainQuadIndexBuffer;
++        return this;
++    }
++
+     protected abstract void render(
+         final ChunkSectionLayer layer,
+         final RenderPass renderPass,
+@@ -47,7 +80,7 @@
+         final boolean renderWireframeTerrain
+     ) {
+         GameRenderer gameRenderer = Minecraft.getInstance().gameRenderer;
+-        GpuTextureView lightmap = gameRenderer.lightmap();
++        GpuTextureView lightmap = net.minecraft.client.renderer.Tessera.terrainLightmap(gameRenderer.lightmap());
+         this.renderLayers(
+             group.layers(),
+             sampler,
+@@ -59,6 +92,31 @@
+         );
+     }
+ 
++    /**
++     * Stage 4 (Tessera): this list's SOLID and CUTOUT sections into the sun shadow map, with the culling-free shadow
++     * pipelines (a list built for the shadow pass: no clusters, LOD or reuse).
++     */
++    public void renderShadowCasters(final RenderPass renderPass, final GpuSampler sampler, final GpuTextureView atlas, final GpuTextureView lightmap) {
++        RenderSystem.AutoStorageIndexBuffer autoIndices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
++        GpuBuffer defaultIndexBuffer;
++        IndexType defaultIndexType;
++        if (this.maxIndicesRequired == 0) {
++            defaultIndexBuffer = null;
++            defaultIndexType = null;
++        } else if (this.terrainQuadIndexBuffer != null) {
++            defaultIndexBuffer = this.terrainQuadIndexBuffer;
++            defaultIndexType = IndexType.SHORT;
++        } else {
++            defaultIndexBuffer = autoIndices.getBuffer();
++            defaultIndexType = autoIndices.type();
++        }
++        renderPass.setUniform("TerrainUniform", this.terrainTransformUBO);
++        renderPass.setUniform("Sampler0", atlas, sampler);
++        renderPass.setUniform("Sampler2", lightmap, RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR));
++        this.render(ChunkSectionLayer.SOLID, renderPass, defaultIndexBuffer, defaultIndexType, null, RenderPipelines.TESSERA_SHADOW_SOLID);
++        this.render(ChunkSectionLayer.CUTOUT, renderPass, defaultIndexBuffer, defaultIndexType, null, RenderPipelines.TESSERA_SHADOW_CUTOUT);
++    }
++
+     public void renderOit(
+         final GpuSampler sampler,
+         final OitStage stage,
+@@ -89,19 +147,35 @@
+         final @Nullable RenderPipeline renderPipelineOverrideMultidraw
+     ) {
+         RenderSystem.AutoStorageIndexBuffer autoIndices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
+-        GpuBuffer defaultIndexBuffer = this.maxIndicesRequired == 0 ? null : autoIndices.getBuffer();
+-        IndexType defaultIndexType = this.maxIndicesRequired == 0 ? null : autoIndices.type();
++        GpuBuffer defaultIndexBuffer;
++        IndexType defaultIndexType;
++        if (this.maxIndicesRequired == 0) {
++            defaultIndexBuffer = null;
++            defaultIndexType = null;
++        } else if (this.terrainQuadIndexBuffer != null) {
++            defaultIndexBuffer = this.terrainQuadIndexBuffer;
++            defaultIndexType = IndexType.SHORT;
++        } else {
++            defaultIndexBuffer = autoIndices.getBuffer();
++            defaultIndexType = autoIndices.type();
++        }
+         renderPass.setUniform("TerrainUniform", this.terrainTransformUBO);
+         renderPass.setUniform("Sampler0", atlas, sampler);
+         renderPass.setUniform("Sampler2", lightmap, RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR));
++        if (net.minecraft.client.renderer.Tessera.ENABLED) {
++            net.minecraft.client.renderer.Tessera.INSTANCE.bindTerrain(renderPass, true);
++        }
+ 
+         for (ChunkSectionLayer layer : layers) {
++            if (NO_TRANSLUCENT && layer.translucent()) continue;   // diagnostic (-Dmc.diag.noTranslucent=true): look under the water
+             renderPass.pushDebugGroup(() -> "Terrain layer: " + layer.label());
+             this.render(layer, renderPass, defaultIndexBuffer, defaultIndexType, renderPipelineOverride, renderPipelineOverrideMultidraw);
+             renderPass.popDebugGroup();
+         }
+     }
+ 
++    private static final boolean NO_TRANSLUCENT = Boolean.getBoolean("mc.diag.noTranslucent");
++
+     public static final class DrawIndirect extends ChunkSectionsToRender {
+         private final EnumMap<ChunkSectionLayer, List<ChunkSectionsToRender.GpuMultiDrawIndexedIndirect>> drawGroupsPerLayer;
+         private final GpuBufferSlice chunkSectionInfos;
+@@ -126,18 +200,40 @@
+             final @Nullable RenderPipeline renderPipelineOverride,
+             final @Nullable RenderPipeline renderPipelineOverrideMultidraw
+         ) {
+-            renderPass.setPipeline(
+-                RenderSystem.getCompiledPipeline(renderPipelineOverrideMultidraw != null ? renderPipelineOverrideMultidraw : layer.pipeline(true))
+-            );
++            RenderPipeline pipeline = renderPipelineOverrideMultidraw != null ? renderPipelineOverrideMultidraw : layer.pipeline(true);
++            List<ChunkSectionsToRender.GpuMultiDrawIndexedIndirect> drawGroups = this.drawGroupsPerLayer.get(layer);
++            // Stage 3 (Lod): LOD translucent (water) is farther than every real section: drawn before them.
++            if (layer.translucent()) {
++                this.renderLod(layer, renderPass, renderPipelineOverrideMultidraw);
++            }
++            // S5: start with the format of the first non-empty group, switch pipelines where the format changes (round 12 Part B:
++            // the greedy prototype's groups are a third format).
++            boolean boundCompact = false;
++            boolean boundGreedy = false;
++            for (ChunkSectionsToRender.GpuMultiDrawIndexedIndirect indirectDraw : drawGroups) {
++                if (indirectDraw.drawCount() > 0) {
++                    boundCompact = indirectDraw.compact();
++                    boundGreedy = indirectDraw.greedy();
++                    break;
++                }
++            }
++
++            renderPass.setPipeline(RenderSystem.getCompiledPipeline(formatVariant(pipeline, boundCompact, boundGreedy)));
+             DeviceLimits deviceLimits = RenderSystem.getDevice().getDeviceInfo().limits();
+             int maxDrawIndirectDrawCount = deviceLimits.maxDrawIndirectDrawCount();
+-            List<ChunkSectionsToRender.GpuMultiDrawIndexedIndirect> drawGroups = this.drawGroupsPerLayer.get(layer);
+             if (!drawGroups.isEmpty()) {
+                 renderPass.setVertexBuffer(1, this.chunkSectionInfos);
+             }
+ 
+             for (ChunkSectionsToRender.GpuMultiDrawIndexedIndirect indirectDraw : drawGroups) {
+                 if (indirectDraw.drawCount() > 0) {
++                    if (indirectDraw.compact() != boundCompact || indirectDraw.greedy() != boundGreedy) {
++                        boundCompact = indirectDraw.compact();
++                        boundGreedy = indirectDraw.greedy();
++                        renderPass.setPipeline(RenderSystem.getCompiledPipeline(formatVariant(pipeline, boundCompact, boundGreedy)));
++                        renderPass.setVertexBuffer(1, this.chunkSectionInfos);
++                    }
++
+                     renderPass.setVertexBuffer(0, indirectDraw.vertexBuffer);
+                     IndexType indexType = indirectDraw.indexType() == null ? defaultIndexType : indirectDraw.indexType();
+                     renderPass.setIndexBuffer(indirectDraw.indexBuffer() == null ? defaultIndexBuffer : indirectDraw.indexBuffer().buffer(), indexType);
+@@ -155,12 +251,137 @@
+                     }
+                 }
+             }
++
++            // Round 12 (a): the layer's GPU-culled clusters, one indirect draw per vertex heap (TerrainClusters).
++            if (this.clusterDraws != null && renderPipelineOverrideMultidraw == null) {
++                RenderPipeline clusterPipeline = RenderPipelines.clusterTerrainVariant(pipeline);
++                for (TerrainClusters.Draw draw : this.clusterDraws) {
++                    if (draw.layer() != layer.ordinal() || clusterPipeline == null) {
++                        continue;
++                    }
++                    renderPass.setPipeline(RenderSystem.getCompiledPipeline(clusterPipeline));
++                    renderPass.setVertexBuffer(0, draw.vertexBuffer());
++                    renderPass.setVertexBuffer(1, this.chunkSectionInfos);
++                    renderPass.setVertexBuffer(com.mojang.renderpearl.backend.metal.TerrainVertexMsl.CLUSTER_QUADS_SLOT, draw.quads());
++                    renderPass.setVertexBuffer(com.mojang.renderpearl.backend.metal.TerrainVertexMsl.CLUSTER_ITEMS_SLOT, draw.items());
++                    renderPass.setIndexBuffer(draw.indexBuffer(), IndexType.INT);
++                    renderPass.drawIndexedIndirect(draw.args(), 1);
++                }
++            }
++
++            if (!layer.translucent()) {
++                this.renderLod(layer, renderPass, renderPipelineOverrideMultidraw);
++            }
+         }
++
++        /** Stage 3 (Lod, docs/stage3/LOD-DESIGN.md §5.2): the layer's GPU-culled LOD clusters, one indirect draw per vertex arena. */
++        private void renderLod(final ChunkSectionLayer layer, final RenderPass renderPass, final @Nullable RenderPipeline renderPipelineOverrideMultidraw) {
++            if (this.lodDraws == null || renderPipelineOverrideMultidraw != null || (Lod.layerMask & 1 << layer.ordinal()) == 0) {
++                return;
++            }
++            if (this.lodAsyncProbe != null && this.lodAsyncProbe.render(this,layer,renderPass)) {
++                // GPU selected a complete reprojected image OR the current synchronous args.
++            } else if (this.lodReuse == null || !this.lodReuse.composite(this, layer, renderPass)) {
++                this.renderLodUncached(layer, renderPass);
++            }
++            // Round 3 (LodGpu occlusion): the box queries after the last opaque LOD layer (CUTOUT), before anything else.
++            if (layer == ChunkSectionLayer.CUTOUT && this.lodOcclusion != null) {
++                this.lodOcclusion.accept(renderPass);
++            }
++        }
++
++        void renderLodUncached(ChunkSectionLayer layer, RenderPass renderPass) {
++            this.renderLodUncached(layer,renderPass,null);
++        }
++
++        /** Optional full-list argument table from the GPU same-frame fallback decision. */
++        void renderLodUncached(ChunkSectionLayer layer, RenderPass renderPass, @Nullable List<GpuBufferSlice> selectedArgs) {
++            if(selectedArgs!=null && selectedArgs.size()!=this.lodDraws.size()) throw new IllegalArgumentException("LOD fallback draw order mismatch");
++            // Round 2 draw codes: layer | 8 (compact records) | 16 (fading sections: the LOD_FADE pipelines).
++            int bound = -1;
++            int drawIndex=0;
++            for (TerrainClusters.Draw draw : this.lodDraws) {
++                GpuBufferSlice args=selectedArgs==null?draw.args():selectedArgs.get(drawIndex);
++                drawIndex++;
++                int code = draw.layer();
++                if ((code & 7) != layer.ordinal()) {
++                    continue;
++                }
++                RenderPipeline p = RenderPipelines.lodPipeline(code);
++                if (p == null) {
++                    continue;
++                }
++                if (bound != code) {
++                    renderPass.setPipeline(RenderSystem.getCompiledPipeline(p));
++                    bound = code;
++                }
++                renderPass.setVertexBuffer(0, draw.vertexBuffer());
++                renderPass.setVertexBuffer(1, this.lodSectionInfos);
++                renderPass.setVertexBuffer(com.mojang.renderpearl.backend.metal.TerrainVertexMsl.CLUSTER_QUADS_SLOT, draw.quads());
++                renderPass.setVertexBuffer(com.mojang.renderpearl.backend.metal.TerrainVertexMsl.CLUSTER_ITEMS_SLOT, draw.items());
++                renderPass.setIndexBuffer(draw.indexBuffer(), IndexType.INT);
++                renderPass.drawIndexedIndirect(args, 1);
++            }
++        }
++
++        List<TerrainClusters.Draw> lodDrawsForReuse() { return this.lodDraws; }
++
++        /** Farsight turn strips: one layer of a separately culled LOD list (same section infos, same pipelines). */
++        void renderLodList(List<TerrainClusters.Draw> draws, ChunkSectionLayer layer, RenderPass renderPass) {
++            int bound = -1;
++            for (TerrainClusters.Draw draw : draws) {
++                int code = draw.layer();
++                if ((code & 7) != layer.ordinal()) continue;
++                RenderPipeline p = RenderPipelines.lodPipeline(code);
++                if (p == null) continue;
++                if (bound != code) {
++                    renderPass.setPipeline(RenderSystem.getCompiledPipeline(p));
++                    bound = code;
++                }
++                renderPass.setVertexBuffer(0, draw.vertexBuffer());
++                renderPass.setVertexBuffer(1, this.lodSectionInfos);
++                renderPass.setVertexBuffer(com.mojang.renderpearl.backend.metal.TerrainVertexMsl.CLUSTER_QUADS_SLOT, draw.quads());
++                renderPass.setVertexBuffer(com.mojang.renderpearl.backend.metal.TerrainVertexMsl.CLUSTER_ITEMS_SLOT, draw.items());
++                renderPass.setIndexBuffer(draw.indexBuffer(), IndexType.INT);
++                renderPass.drawIndexedIndirect(draw.args(), 1);
++            }
++        }
++        private @Nullable LodReuse lodReuse;
++        public DrawIndirect withLodReuse(@Nullable LodReuse reuse) { this.lodReuse = reuse; return this; }
++        private @Nullable LodAsyncProducerProbe lodAsyncProbe;
++        public DrawIndirect withLodAsyncProbe(@Nullable LodAsyncProducerProbe probe) { this.lodAsyncProbe = probe; return this; }
++
++        private java.util.function.@Nullable Consumer<RenderPass> lodOcclusion;
++        /** Stage 3 r3: this frame's LOD occlusion box draw (null: none). */
++        public DrawIndirect withLodOcclusion(final java.util.function.@Nullable Consumer<RenderPass> lodOcclusion) {
++            this.lodOcclusion = lodOcclusion;
++            return this;
++        }
++
++        private @Nullable List<TerrainClusters.Draw> lodDraws;
++        private @Nullable GpuBufferSlice lodSectionInfos;
++
++        /** Stage 3: this frame's LOD cluster draws and the LOD section infos they index (null: none). */
++        public DrawIndirect withLodDraws(final @Nullable List<TerrainClusters.Draw> lodDraws, final @Nullable GpuBufferSlice lodSectionInfos) {
++            this.lodDraws = lodDraws;
++            this.lodSectionInfos = lodSectionInfos;
++            return this;
++        }
++
++        private @Nullable List<TerrainClusters.Draw> clusterDraws;
++
++        /** Round 12 (a): this frame's cluster draws (null: none). */
++        public DrawIndirect withClusterDraws(final @Nullable List<TerrainClusters.Draw> clusterDraws) {
++            this.clusterDraws = clusterDraws;
++            return this;
++        }
+     }
+ 
+     public static final class DrawSeparate extends ChunkSectionsToRender {
+         private final Map<ChunkSectionLayer, List<RenderPass.Draw<GpuBufferSlice[]>>> drawsPerLayer;
+         private final GpuBufferSlice[] chunkSectionInfos;
++        /** S5: draws of compact section-layers per layer (null: none), drawn after the 28-byte ones. */
++        private @Nullable Map<ChunkSectionLayer, List<RenderPass.Draw<GpuBufferSlice[]>>> compactDrawsPerLayer;
+ 
+         public DrawSeparate(
+             final GpuBufferSlice terrainTransformUBO,
+@@ -173,6 +394,12 @@
+             this.chunkSectionInfos = chunkSectionInfos;
+         }
+ 
++        /** S5: the draws of the layers' compact section-layers (16-byte vertices, compact pipeline variants). */
++        public DrawSeparate withCompactDraws(final @Nullable Map<ChunkSectionLayer, List<RenderPass.Draw<GpuBufferSlice[]>>> compactDrawsPerLayer) {
++            this.compactDrawsPerLayer = compactDrawsPerLayer;
++            return this;
++        }
++
+         @Override
+         protected void render(
+             final ChunkSectionLayer layer,
+@@ -182,16 +409,74 @@
+             final @Nullable RenderPipeline renderPipelineOverride,
+             final @Nullable RenderPipeline renderPipelineOverrideMultidraw
+         ) {
+-            renderPass.setPipeline(RenderSystem.getCompiledPipeline(renderPipelineOverride != null ? renderPipelineOverride : layer.pipeline(false)));
++            RenderPipeline pipeline = renderPipelineOverride != null ? renderPipelineOverride : layer.pipeline(false);
++            renderPass.setPipeline(RenderSystem.getCompiledPipeline(pipeline));
+             List<RenderPass.Draw<GpuBufferSlice[]>> draws = this.drawsPerLayer.get(layer);
+             if (!draws.isEmpty()) {
+                 renderPass.drawMultipleIndexed(draws, defaultIndexBuffer, defaultIndexType, List.of("ChunkSection"), this.chunkSectionInfos);
+             }
++
++            List<RenderPass.Draw<GpuBufferSlice[]>> compactDraws = this.compactDrawsPerLayer == null ? null : this.compactDrawsPerLayer.get(layer);
++            if (compactDraws != null && !compactDraws.isEmpty()) {
++                renderPass.setPipeline(RenderSystem.getCompiledPipeline(compactVariant(pipeline)));
++                renderPass.drawMultipleIndexed(compactDraws, defaultIndexBuffer, defaultIndexType, List.of("ChunkSection"), this.chunkSectionInfos);
++            }
+         }
+     }
+ 
++    /** S5 / round 12 Part B: the pipeline for a group's vertex format. */
++    static RenderPipeline formatVariant(final RenderPipeline pipeline, final boolean compact, final boolean greedy) {
++        if (compact) {
++            return compactVariant(pipeline);
++        }
++        if (greedy) {
++            RenderPipeline variant = RenderPipelines.greedyTerrainVariant(pipeline);
++            if (variant == null) {
++                throw new IllegalStateException("No greedy terrain variant of " + pipeline.getLocation());
++            }
++            return variant;
++        }
++        return pipeline;
++    }
++
++    /** S5: the compact-vertex variant of a terrain pipeline (only SOLID/CUTOUT/wireframe layers are ever compact). */
++    static RenderPipeline compactVariant(final RenderPipeline pipeline) {
++        RenderPipeline variant = RenderPipelines.compactTerrainVariant(pipeline);
++        if (variant == null) {
++            throw new IllegalStateException("No compact terrain vertex variant of " + pipeline.getLocation());
++        }
++
++        return variant;
++    }
++
+     public record GpuMultiDrawIndexedIndirect(
+-        GpuBufferSlice vertexBuffer, @Nullable GpuBufferSlice indexBuffer, @Nullable IndexType indexType, GpuBufferSlice indirectCommandBuffer, int drawCount
++        GpuBufferSlice vertexBuffer,
++        @Nullable GpuBufferSlice indexBuffer,
++        @Nullable IndexType indexType,
++        GpuBufferSlice indirectCommandBuffer,
++        int drawCount,
++        boolean compact,
++        boolean greedy
+     ) {
++        public GpuMultiDrawIndexedIndirect(
++            final GpuBufferSlice vertexBuffer,
++            final @Nullable GpuBufferSlice indexBuffer,
++            final @Nullable IndexType indexType,
++            final GpuBufferSlice indirectCommandBuffer,
++            final int drawCount,
++            final boolean compact
++        ) {
++            this(vertexBuffer, indexBuffer, indexType, indirectCommandBuffer, drawCount, compact, false);
++        }
++
++        public GpuMultiDrawIndexedIndirect(
++            final GpuBufferSlice vertexBuffer,
++            final @Nullable GpuBufferSlice indexBuffer,
++            final @Nullable IndexType indexType,
++            final GpuBufferSlice indirectCommandBuffer,
++            final int drawCount
++        ) {
++            this(vertexBuffer, indexBuffer, indexType, indirectCommandBuffer, drawCount, false, false);
++        }
+     }
+ }

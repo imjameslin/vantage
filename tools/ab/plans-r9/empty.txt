@@ -1,0 +1,5 @@
+# Round 9: what the empty frame (every draw skipped) spends on the GPU, median view; build/client-r9d3.jar.
+abab e-color build/client-r9d3.jar --jvm=-Dmcmetal.skipPipelines=* --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalDiag#flags=0|1 --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab e-depth build/client-r9d3.jar --jvm=-Dmcmetal.skipPipelines=* --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalDiag#flags=0|2 --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab e-cleardraw build/client-r9d3.jar --jvm=-Dmcmetal.skipPipelines=* --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalDiag#flags=0|4 --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab f-cleardraw build/client-r9d3.jar --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalDiag#flags=0|4 --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5

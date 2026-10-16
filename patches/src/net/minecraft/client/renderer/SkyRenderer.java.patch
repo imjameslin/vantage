@@ -1,0 +1,104 @@
+--- a/net/minecraft/client/renderer/SkyRenderer.java
++++ b/net/minecraft/client/renderer/SkyRenderer.java
+@@ -1,3 +1,6 @@
++// Patched copy of the vanilla 26.3 class (stage 4, Tessera). Differences from vanilla:
++//  - with -Dmc.shaders=true the sky disc pipeline (RenderPipelines.SKY) carries the Tessera bind group: the sky and dark
++//    discs bind the frame's light block (core/sky.fsh draws the Tessera sky gradient and sun glow).
+ package net.minecraft.client.renderer;
+ 
+ import com.mojang.blaze3d.pipeline.RenderTarget;
+@@ -128,8 +131,10 @@
+ 
+     public void render(final GpuBufferSlice skyFog, final SkyRenderState state) {
+         RenderSystem.setShaderFog(skyFog);
+-        GpuTextureView colorTexture = this.renderTarget.getColorTextureView();
+-        GpuTextureView depthTexture = this.renderTarget.getDepthTextureView();
++        // the current frame target (GameRenderer: a smaller world target under a render scale), not the one from construction
++        RenderTarget target = net.minecraft.client.Minecraft.getInstance().gameRenderer.mainRenderTarget();
++        GpuTextureView colorTexture = target.getColorTextureView();
++        GpuTextureView depthTexture = target.getDepthTextureView();
+ 
+         try (RenderPass renderPass = RenderSystem.getDevice()
+                 .createCommandEncoder()
+@@ -147,11 +152,15 @@
+ 
+             PoseStack poseStack = new PoseStack();
+             this.renderSkyDisc(renderPass, state.skyColor);
+-            this.renderSunriseAndSunset(renderPass, poseStack, state.sunAngle, state.sunriseAndSunsetColor);
++            if (!Tessera.active) {
++                // stage 4: the Tessera sky (core/sky.fsh) draws its own glow around the sun; vanilla's horizon fan would sit above it
++                this.renderSunriseAndSunset(renderPass, poseStack, state.sunAngle, state.sunriseAndSunsetColor);
++            }
+             this.renderSunMoonAndStars(
+                 renderPass, poseStack, state.sunAngle, state.moonAngle, state.starAngle, state.moonPhase, state.rainBrightness, state.starBrightness
+             );
+-            if (state.shouldRenderDarkDisc) {
++            // stage 4: no dark lower half under the Tessera sky (the sky goes on below the horizon)
++            if (state.shouldRenderDarkDisc && !Tessera.active) {
+                 this.renderDarkDisc(renderPass);
+             }
+         }
+@@ -162,6 +171,9 @@
+             .writeTransform(RenderSystem.getModelViewMatrixCopy(), new Vector4f(skyColor, 1.0F));
+         renderPass.pushDebugGroup(() -> "Sky disc");
+         renderPass.setPipeline(RenderSystem.getCompiledPipeline(RenderPipelines.SKY));
++        if (Tessera.ENABLED) {
++            Tessera.INSTANCE.bindTerrain(renderPass, true);
++        }
+         renderPass.setUniform("DynamicTransforms", dynamicTransforms);
+         renderPass.setVertexBuffer(0, this.topSkyBuffer.slice());
+         renderPass.draw(10, 1, 0, 0);
+@@ -172,10 +184,14 @@
+         Matrix4fStack modelViewStack = RenderSystem.getModelViewStack();
+         modelViewStack.pushMatrix();
+         modelViewStack.translate(0.0F, 12.0F, 0.0F);
+-        GpuBufferSlice dynamicTransforms = RenderSystem.getDynamicUniforms().writeTransform(new Matrix4f(modelViewStack), new Vector4f(0.0F, 0.0F, 0.0F, 1.0F));
++        // Tessera: alpha 0.999 marks the dark disc for sky.fsh (the sky disc can be black at night too)
++        GpuBufferSlice dynamicTransforms = RenderSystem.getDynamicUniforms().writeTransform(new Matrix4f(modelViewStack), new Vector4f(0.0F, 0.0F, 0.0F, Tessera.ENABLED ? 0.999F : 1.0F));
+         renderPass.pushDebugGroup(() -> "Dark disc");
+         renderPass.setPipeline(RenderSystem.getCompiledPipeline(RenderPipelines.SKY));
+         RenderSystem.bindDefaultUniforms(renderPass);
++        if (Tessera.ENABLED) {
++            Tessera.INSTANCE.bindTerrain(renderPass, true);
++        }
+         renderPass.setUniform("DynamicTransforms", dynamicTransforms);
+         renderPass.setVertexBuffer(0, this.bottomSkyBuffer.slice());
+         renderPass.draw(10, 1, 0, 0);
+@@ -197,7 +213,10 @@
+         poseStack.rotateDegrees(Axis.YP, -90.0F);
+         poseStack.pushPose();
+         poseStack.rotate(Axis.XP, sunAngle);
+-        this.renderSun(renderPass, rainBrightness, poseStack);
++        if (!Tessera.active) {
++            // stage 4: core/sky.fsh draws a round glowing sun instead
++            this.renderSun(renderPass, rainBrightness, poseStack);
++        }
+         poseStack.popPose();
+         poseStack.pushPose();
+         poseStack.rotate(Axis.XP, moonAngle);
+@@ -222,7 +241,9 @@
+     private void renderMoon(final RenderPass renderPass, final MoonPhase moonPhase, final float rainBrightness, final PoseStack poseStack) {
+         int baseVertex = moonPhase.index() * 4;
+         Matrix4f modelViewMatrix = this.applyCelestialBodyTransform(poseStack, 100.0F, 20.0F);
+-        GpuBufferSlice dynamicTransforms = RenderSystem.getDynamicUniforms().writeTransform(modelViewMatrix, new Vector4f(1.0F, 1.0F, 1.0F, rainBrightness));
++        // stage 4: the moon is added onto the sky, which is much brighter than vanilla's at dusk; full at night only
++        float m = Tessera.active ? Tessera.INSTANCE.moonBrightness() : 1.0F;
++        GpuBufferSlice dynamicTransforms = RenderSystem.getDynamicUniforms().writeTransform(modelViewMatrix, new Vector4f(m, m, m, rainBrightness));
+         this.drawCelestialBody(() -> "Moon", renderPass, dynamicTransforms, this.quadIndices.getBuffer(6), this.moonBuffer, baseVertex);
+     }
+ 
+@@ -434,9 +455,13 @@
+     private void buildSkyDisc(final VertexConsumer builder, final float yy) {
+         float x = Math.signum(yy) * 512.0F;
+         builder.addVertex(0.0F, yy, 0.0F);
++        // stage 4: the top disc becomes a steep cone reaching far below the horizon (to about 76 degrees down), so the
++        // sky goes on under the ground: past the far LOD terrain's edge there is our horizon colour, never a rim and the
++        // clear colour below it
++        float rimY = Tessera.ENABLED && yy > 0.0F ? -2048.0F : yy;
+ 
+         for (int i = -180; i <= 180; i += 45) {
+-            builder.addVertex(x * Mth.cos(i * 0.017453292F), yy, 512.0F * Mth.sin(i * 0.017453292F));
++            builder.addVertex(x * Mth.cos(i * 0.017453292F), rimY, 512.0F * Mth.sin(i * 0.017453292F));
+         }
+     }
+ 

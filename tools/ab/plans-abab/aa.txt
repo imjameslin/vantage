@@ -1,0 +1,5 @@
+# A/A validation of mode=abab (CONTRACT 16.AB): main's frozen client (client-r5.jar), the dummy toggle nothing reads,
+# default protocol (12 blocks x 10 s, ABBA, discard 30, warmup 15), 3 launches. Run with ABAB_BENCH_JAR=build/bench-abab1.jar.
+abab abab-aa-1 build/client-r5.jar --bench-prop abab.toggles=bench.Abab#aaNoop=0|1
+abab abab-aa-2 build/client-r5.jar --bench-prop abab.toggles=bench.Abab#aaNoop=0|1
+abab abab-aa-3 build/client-r5.jar --bench-prop abab.toggles=bench.Abab#aaNoop=0|1

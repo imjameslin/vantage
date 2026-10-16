@@ -1,0 +1,19 @@
+--- a/net/minecraft/client/gui/screens/TitleScreen.java
++++ b/net/minecraft/client/gui/screens/TitleScreen.java
+@@ -1,3 +1,7 @@
++// Patched copy of the vanilla 26.3 class (stage-2 W7, instant UI transitions; docs/metal/CONTRACT.md 16.W7). Difference from
++// vanilla: with UiTransitions.instant (-Dmc.ui.instantTransitions, default on) the constructor ignores fading=true, so the
++// first title screen after startup shows its widgets at once instead of fading them in over 2.0 s (they were clickable
++// throughout; only alpha changed).
+ package net.minecraft.client.gui.screens;
+ 
+ import com.mojang.authlib.minecraft.BanDetails;
+@@ -65,7 +69,7 @@
+ 
+     public TitleScreen(final boolean fading, final @Nullable LogoRenderer logoRenderer) {
+         super(TITLE);
+-        this.fading = fading;
++        this.fading = fading && !UiTransitions.instant;
+         this.logoRenderer = Objects.requireNonNullElseGet(logoRenderer, () -> new LogoRenderer(false));
+         this.minecraft.gameRenderer.panorama().startSpin();
+     }

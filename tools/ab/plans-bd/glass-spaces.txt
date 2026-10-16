@@ -1,0 +1,5 @@
+# On-glass diagnosis (results/BASELINE-DEFAULT.md): the non-Spaces fullscreen window was composited for our client (fusion on
+# and off) and for vanilla Vulkan. Does the Spaces fullscreen path (vanilla's default; the patched client with
+# -Dmc.fullscreenSpaces=true) go direct to display in Default mode? Diagnostic only: the user plays non-Spaces.
+static bd-glass-spaces-1 glass --opt renderDistance:16 --jvm=-Dmc.fullscreenSpaces=true --env MCMTL_GLASS_TRACE=1 --env MCMTL_GLASS_TRACE_OUT=bd-glass-spaces-1.glass.csv
+static bd-glass-vksp-1 vk --opt renderDistance:16 --env SDL_VIDEO_MAC_FULLSCREEN_SPACES=1 "--env=DYLD_INSERT_LIBRARIES={ROOT}/build/glass/libglassobs.dylib" --env MCMTL_GLASS_TRACE=1 --env MCMTL_GLASS_TRACE_OUT=bd-glass-vksp-1.glass.csv

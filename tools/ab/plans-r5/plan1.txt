@@ -1,0 +1,9 @@
+# Step 1: frame-trace attribution, static ABBA 2+2 then travel ABBA 2+2
+static r5ab-ft-st-off-1 off --bench-prop frameTrace=true
+static r5ab-ft-st-A-1 A --bench-prop frameTrace=true
+static r5ab-ft-st-A-2 A --bench-prop frameTrace=true
+static r5ab-ft-st-off-2 off --bench-prop frameTrace=true
+travel r5ab-ft-tr-off-1 off --bench-prop frameTrace=true
+travel r5ab-ft-tr-A-1 A --bench-prop frameTrace=true
+travel r5ab-ft-tr-A-2 A --bench-prop frameTrace=true
+travel r5ab-ft-tr-off-2 off --bench-prop frameTrace=true

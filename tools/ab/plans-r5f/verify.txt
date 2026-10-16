@@ -1,0 +1,1 @@
+travel r5f-verify-tr r5 --jvm=-Dmc.fastAnimateTick.verify=true

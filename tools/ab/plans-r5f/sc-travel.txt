@@ -1,0 +1,9 @@
+# Release scorecard, travel (Fancy, RD 16, fresh world): client-r5.jar vs client-r4.jar at shipped defaults, 4+4 ABBA.
+travel r5f-sc-tr-r5-1 r5
+travel r5f-sc-tr-r4-1 r4
+travel r5f-sc-tr-r4-2 r4
+travel r5f-sc-tr-r5-2 r5
+travel r5f-sc-tr-r5-3 r5
+travel r5f-sc-tr-r4-3 r4
+travel r5f-sc-tr-r4-4 r4
+travel r5f-sc-tr-r5-4 r5

@@ -1,0 +1,24 @@
+--- a/com/mojang/blaze3d/vertex/StagingBuffer.java
++++ b/com/mojang/blaze3d/vertex/StagingBuffer.java
+@@ -1,3 +1,5 @@
++// Patched copy of the vanilla 26.3 class. Difference from vanilla (TASK E, docs/metal/CONTRACT.md 16.R5-E): the added
++// read-only fillFraction() used by the optional terrain upload budget (-Dmc.terrain.uploadBudgetKB); nothing else.
+ package com.mojang.blaze3d.vertex;
+ 
+ import com.mojang.renderpearl.api.buffers.GpuBuffer;
+@@ -39,6 +41,15 @@
+ 
+     protected abstract ByteBuffer getWriteBuffer();
+ 
++    /**
++     * TASK E: the fraction of the current write buffer taken by appended (not yet rotated) data. Same thread rules as
++     * {@link #tryAppend} (the owner's lock).
++     */
++    public double fillFraction() {
++        int capacity = this.getWriteBuffer().capacity();
++        return capacity == 0 ? 1.0 : (double)this.nextWriteOffset / capacity;
++    }
++
+     protected abstract void copyTo(final CommandEncoder encoder, final GpuBuffer dstBuffer, long dstOffset, long stagingBufferOffset, long copySize);
+ 
+     protected void rotateBuffer() {

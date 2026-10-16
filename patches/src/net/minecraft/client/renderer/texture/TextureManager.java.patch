@@ -1,0 +1,87 @@
+--- a/net/minecraft/client/renderer/texture/TextureManager.java
++++ b/net/minecraft/client/renderer/texture/TextureManager.java
+@@ -1,3 +1,9 @@
++// Patched copy of the vanilla 26.3 class. Difference from vanilla (TASK E, docs/metal/CONTRACT.md 16.R5-E,
++// -Dmc.asyncEntityTextures=true, default off): getTexture() of a texture that is not registered yet first asks the
++// EntityTexturePrefetch for contents decoded on a background thread from the same resource manager, and applies them
++// exactly as registerAndLoad applies synchronously loaded contents; when there are none it loads synchronously as
++// vanilla. reload() invalidates the prefetch at its start and restarts it once the textures are applied; close() frees it.
++// With the switch off (prefetch == null) every method is vanilla's.
+ package net.minecraft.client.renderer.texture;
+ 
+ import com.mojang.blaze3d.platform.NativeImage;
+@@ -21,6 +27,7 @@
+ import net.minecraft.resources.Identifier;
+ import net.minecraft.server.packs.resources.PreparableReloadListener;
+ import net.minecraft.server.packs.resources.ResourceManager;
++import org.jspecify.annotations.Nullable;
+ import org.slf4j.Logger;
+ 
+ public class TextureManager implements PreparableReloadListener, AutoCloseable {
+@@ -28,6 +35,7 @@
+     private final Map<Identifier, AbstractTexture> byPath = new HashMap<>();
+     private final Set<TickableTexture> tickableTextures = new HashSet<>();
+     private final ResourceManager resourceManager;
++    private final @Nullable EntityTexturePrefetch prefetch = EntityTexturePrefetch.ENABLED ? new EntityTexturePrefetch() : null;
+ 
+     public TextureManager(final ResourceManager resourceManager) {
+         this.resourceManager = resourceManager;
+@@ -36,8 +44,13 @@
+     }
+ 
+     public void registerAndLoad(final Identifier textureId, final ReloadableTexture texture) {
++        this.registerAndApply(textureId, texture, null);
++    }
++
++    /** registerAndLoad with {@code prefetched} contents (TASK E) instead of loading them, when not null. */
++    private void registerAndApply(final Identifier textureId, final ReloadableTexture texture, final @Nullable TextureContents prefetched) {
+         try {
+-            texture.apply(this.loadContentsSafe(textureId, texture));
++            texture.apply(prefetched != null ? prefetched : this.loadContentsSafe(textureId, texture));
+         } catch (Throwable t) {
+             CrashReport report = CrashReport.forThrowable(t, "Uploading texture");
+             CrashReportCategory category = report.addCategory("Uploaded texture");
+@@ -92,7 +105,8 @@
+         }
+ 
+         SimpleTexture texture = new SimpleTexture(location);
+-        this.registerAndLoad(location, texture);
++        TextureContents prefetched = this.prefetch != null ? this.prefetch.take(location) : null;
++        this.registerAndApply(location, texture, prefetched);
+         return texture;
+     }
+ 
+@@ -111,6 +125,10 @@
+ 
+     @Override
+     public void close() {
++        if (this.prefetch != null) {
++            this.prefetch.close();
++        }
++
+         this.byPath.forEach(this::safeClose);
+         this.byPath.clear();
+         this.tickableTextures.clear();
+@@ -124,6 +142,11 @@
+         final Executor reloadExecutor
+     ) {
+         ResourceManager manager = currentReload.resourceManager();
++        if (this.prefetch != null) {
++            // Called right after ReloadableResourceManager swapped its packs: nothing prefetched before is valid now.
++            this.prefetch.invalidate();
++        }
++
+         List<TextureManager.PendingReload> reloads = new ArrayList<>();
+         this.byPath.forEach((var3, texture) -> {
+             if (texture instanceof ReloadableTexture reloadableTexture) {
+@@ -136,6 +159,10 @@
+                 for (TextureManager.PendingReload reload : reloads) {
+                     reload.texture.apply(reload.newContents.join());
+                 }
++
++                if (this.prefetch != null) {
++                    this.prefetch.start(manager);
++                }
+             }, reloadExecutor);
+     }
+ 

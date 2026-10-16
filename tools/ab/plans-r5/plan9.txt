@@ -1,0 +1,15 @@
+# Step 5c: hysteresis on top of the decided set (WINH = WIN + transientHysteresis), static 3+3 and travel 4+4, ABBA
+travel r5ab-h-tr-WIN-1 WIN
+travel r5ab-h-tr-WINH-1 WIN+mcmetal.transientHysteresis=true
+travel r5ab-h-tr-WINH-2 WIN+mcmetal.transientHysteresis=true
+travel r5ab-h-tr-WIN-2 WIN
+travel r5ab-h-tr-WIN-3 WIN
+travel r5ab-h-tr-WINH-3 WIN+mcmetal.transientHysteresis=true
+travel r5ab-h-tr-WINH-4 WIN+mcmetal.transientHysteresis=true
+travel r5ab-h-tr-WIN-4 WIN
+static r5ab-h-st-WIN-1 WIN
+static r5ab-h-st-WINH-1 WIN+mcmetal.transientHysteresis=true
+static r5ab-h-st-WINH-2 WIN+mcmetal.transientHysteresis=true
+static r5ab-h-st-WIN-2 WIN
+static r5ab-h-st-WIN-3 WIN
+static r5ab-h-st-WINH-3 WIN+mcmetal.transientHysteresis=true

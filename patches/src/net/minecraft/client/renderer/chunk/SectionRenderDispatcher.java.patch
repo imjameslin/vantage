@@ -1,0 +1,759 @@
+--- a/net/minecraft/client/renderer/chunk/SectionRenderDispatcher.java
++++ b/net/minecraft/client/renderer/chunk/SectionRenderDispatcher.java
+@@ -1,3 +1,21 @@
++// Patched copy of the vanilla 26.3 class (render-thread CPU work, docs/stage2/TERRAIN-PLAN.md S4 P1). Differences from
++// vanilla: each layer's vertex and index UberGpuBuffer gets an AllocationListener that mirrors the allocation of every
++// CompiledSectionMesh key onto the mesh itself (CompiledSectionMesh.setUberSlice), so the terrain draw list
++// (TerrainDrawList, TerrainToggles.fastDrawList) reads exactly what getRenderSectionSlice would return without two
++// HashMap lookups and an allocation per section-layer. The listeners run where the maps change, under copyLock.
++// S5 (TerrainToggles.COMPACT_VERTICES): the SOLID/CUTOUT vertex heaps are aligned to lcm(28, 16) = 112 bytes so that 16-byte
++// compact meshes (TerrainCompact) and 28-byte meshes can share them; a compiled layer uploads its compact bytes
++// (SectionCompiler.Results.compactVertices) when it has them. meshMemoryReport() sums the resident vertex/index bytes and
++// (with -Dmc.terrain.meshStats) the bytes staged for upload per layer (addSectionBuffersToUberBuffer).
++// TASK E upload budget (TravelHitchToggles.UPLOAD_BUDGET_KB, default 0 = off; docs/metal/CONTRACT.md 16.R5-E): the per-frame
++// pass (uploadTerrainBuffersForFrame) uploads up to the budget and carries the rest over for at most
++// UPLOAD_MAX_DELAY_FRAMES frames (UberGpuBuffer.UploadBudget); it flushes while the client waits for the player's section
++// and once the staging buffer is half full, and uploadTerrainBuffersToGpu() (staging full on the render thread) always
++// flushes. A mesh whose section moved to another node before its carried upload completed is released instead of shown.
++// Per-section ordering in budget mode (also without a budget when nearHandoff is armed at startup): every CompileTask
++// gets a mesh sequence number (meshSeq, taken when the task is created; otherwise 0) and a RenderSection only
++// ever replaces its mesh with a newer one (appliedMeshSeq, under copyLock): an older mesh whose carried upload completes
++// after a newer mesh (async, compileSync or EMPTY) was shown is released instead of shown (CONTRACT.md 16.R5-E).
+ package net.minecraft.client.renderer.chunk;
+ 
+ import com.mojang.blaze3d.systems.RenderSystem;
+@@ -10,12 +28,14 @@
+ import com.mojang.renderpearl.api.buffers.GpuBuffer;
+ import com.mojang.renderpearl.api.device.GpuDevice;
+ import com.mojang.renderpearl.api.vertex.VertexFormat;
++import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
+ import java.nio.ByteBuffer;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Map.Entry;
+ import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicLong;
+ import java.util.concurrent.atomic.AtomicReference;
+ import java.util.concurrent.locks.ReentrantLock;
+ import java.util.function.Consumer;
+@@ -38,7 +58,25 @@
+ import org.jspecify.annotations.Nullable;
+ 
+ public class SectionRenderDispatcher {
++    /**
++     * Stage 4 (Tessera): bumped whenever the shown mesh or the buffer allocations of a section inside the watched column
++     * box change (shadow caster list cache). Box = sections within {@link #watchRadius} of ({@link #watchX},
++     * {@link #watchZ}) horizontally; a negative radius watches every section.
++     */
++    public static volatile long meshEpoch;
++    public static volatile int watchX;
++    public static volatile int watchZ;
++    public static volatile int watchRadius = -1;
++
++    static void meshTouched(final long sectionNode) {
++        int r = watchRadius;
++        if (r < 0 || Math.abs(SectionPos.x(sectionNode) - watchX) <= r && Math.abs(SectionPos.z(sectionNode) - watchZ) <= r) {
++            meshEpoch++;
++        }
++    }
+     public static final int NEARBY_SECTION_DISTANCE_IN_BLOCKS = 32;
++    /** Default-off startup prerequisite for authoritative EMPTY; independent of LOD/native admission and runtime toggles. */
++    private static final boolean NEAR_HANDOFF_STARTUP = Boolean.getBoolean("mc.lod.nearHandoff");
+     private final SectionTaskDynamicQueue queue = new SectionTaskDynamicQueue();
+     private final SectionBufferBuilderPack fixedBuffers;
+     private final SectionBufferBuilderPool bufferPool;
+@@ -50,6 +88,14 @@
+     private final StagingBuffer stagingBuffer;
+     private final Map<ChunkSectionLayer, SectionRenderDispatcher.SectionUberBuffers> chunkUberBuffers;
+     private final ReentrantLock copyLock = new ReentrantLock();
++    /** TASK E: the per-frame upload budget shared by every uber buffer (null = vanilla uploads). */
++    private final UberGpuBuffer.@Nullable UploadBudget uploadBudget = TravelHitchToggles.UPLOAD_BUDGET_KB > 0
++        ? new UberGpuBuffer.UploadBudget(TravelHitchToggles.UPLOAD_BUDGET_KB * 1024L, TravelHitchToggles.UPLOAD_MAX_DELAY_FRAMES)
++        : null;
++    /** TASK E: keys whose vertex upload was carried over in the current layer's vertex pass (reused, render thread). */
++    private final ObjectOpenHashSet<SectionMesh> carriedUploads = new ObjectOpenHashSet<>();
++    /** Source of budget/armed CompileTask.meshSeq and, only when armed, reset barriers. */
++    private final AtomicLong meshSeqCounter = new AtomicLong();
+ 
+     public SectionRenderDispatcher(
+         final TracingExecutor executor,
+@@ -69,8 +115,23 @@
+         this.stagingBuffer = StagingBuffer.create("Chunk", gpuDevice, 102760448);
+         this.chunkUberBuffers = Util.makeEnumMap(ChunkSectionLayer.class, layer -> {
+             VertexFormat vertexFormat = layer.pipeline(false).getVertexFormatBinding(0);
+-            UberGpuBuffer<SectionMesh> vertexUberBuffer = new UberGpuBuffer<>(layer.label(), 32, 134217728, vertexFormat.getVertexSize(), this.stagingBuffer);
++            // S5: offsets must be exact multiples of both vertex sizes when compact meshes share the heap.
++            int vertexAlignment = TerrainToggles.COMPACT_VERTICES && !layer.translucent() ? TerrainCompact.SHARED_ALIGNMENT : vertexFormat.getVertexSize();
++            UberGpuBuffer<SectionMesh> vertexUberBuffer = new UberGpuBuffer<>(layer.label(), 32, 134217728, vertexAlignment, this.stagingBuffer);
+             UberGpuBuffer<SectionMesh> indexUberBuffer = new UberGpuBuffer<>(layer.label(), 64, 33554432, 8, this.stagingBuffer);
++            vertexUberBuffer.setUploadBudget(this.uploadBudget);
++            indexUberBuffer.setUploadBudget(this.uploadBudget);
++            int layerIndex = layer.ordinal();
++            vertexUberBuffer.setAllocationListener((mesh, buffer, offset) -> {
++                if (mesh instanceof CompiledSectionMesh compiled) {
++                    compiled.setUberSlice(layerIndex, false, buffer, offset);
++                }
++            });
++            indexUberBuffer.setAllocationListener((mesh, buffer, offset) -> {
++                if (mesh instanceof CompiledSectionMesh compiled) {
++                    compiled.setUberSlice(layerIndex, true, buffer, offset);
++                }
++            });
+             return new SectionRenderDispatcher.SectionUberBuffers(vertexUberBuffer, indexUberBuffer);
+         });
+     }
+@@ -137,7 +198,64 @@
+         this.copyLock.unlock();
+     }
+ 
++    /** With near handoff armed, EMPTY can overtake staged uploads even without an upload budget. */
++    private long nextMeshSeq() {
++        return NEAR_HANDOFF_STARTUP || this.uploadBudget != null ? this.meshSeqCounter.incrementAndGet() : 0L;
++    }
++
++    /**
++     * The per-frame upload pass (LevelRenderer, render thread, copyLock held). Without the TASK E budget this is
++     * {@link #uploadTerrainBuffersToGpu()}. With it, the pass flushes everything while {@code waitingForPlayerSection}
++     * (level loading: the level-ready signal keeps vanilla timing) or when the staging buffer is at least
++     * {@link TravelHitchToggles#UPLOAD_FLUSH_FILL} full (so it drains and rotates as in vanilla), and otherwise uploads
++     * within the budget.
++     */
++    public void uploadTerrainBuffersForFrame(final boolean waitingForPlayerSection) {
++        UberGpuBuffer.UploadBudget budget = this.uploadBudget;
++        if (budget == null) {
++            this.uploadTerrainBuffersToGpu();
++            return;
++        }
++
++        budget.beginFrame(waitingForPlayerSection || this.stagingBuffer.fillFraction() >= TravelHitchToggles.UPLOAD_FLUSH_FILL);
++        this.uploadBudgeted(budget);
++    }
++
++    /** TASK E budget mode: vanilla's layer loop over the budgeted passes (the index pass follows the vertex pass's carries). */
++    private void uploadBudgeted(final UberGpuBuffer.UploadBudget budget) {
++        GpuDevice device = RenderSystem.getDevice();
++        ObjectOpenHashSet<SectionMesh> carried = this.carriedUploads;
++
++        try (StagingBuffer.Uploader uploader = this.stagingBuffer.startUploading(device.createCommandEncoder())) {
++            for (SectionRenderDispatcher.SectionUberBuffers buffers : this.chunkUberBuffers.values()) {
++                carried.clear();
++                boolean performedBufferResize = buffers.vertexBuffer.uploadStagedAllocationsBudgeted(device, uploader, budget, true, carried);
++                buffers.indexBuffer.uploadStagedAllocationsBudgeted(device, uploader, budget, false, carried);
++                if (performedBufferResize) {
++                    break;
++                }
++            }
++        } finally {
++            carried.clear();
++        }
++    }
++
++    /** Uploads every staged allocation (vanilla; with the TASK E budget: a flush outside the frame's pass). */
+     public void uploadTerrainBuffersToGpu() {
++        UberGpuBuffer.UploadBudget budget = this.uploadBudget;
++        if (budget != null) {
++            boolean frameFlush = budget.flush;
++            budget.flush = true;
++
++            try {
++                this.uploadBudgeted(budget);
++            } finally {
++                budget.flush = frameFlush;
++            }
++
++            return;
++        }
++
+         GpuDevice device = RenderSystem.getDevice();
+ 
+         try (StagingBuffer.Uploader uploader = this.stagingBuffer.startUploading(device.createCommandEncoder())) {
+@@ -159,7 +277,14 @@
+     }
+ 
+     public void clearCompileQueue() {
+-        this.queue.clear();
++        // Armed cancellation takes copyLock. Acquire it before the queue's monitor, including for reentrant callers.
++        if (NEAR_HANDOFF_STARTUP) this.copyLock.lock();
++
++        try {
++            this.queue.clear();
++        } finally {
++            if (NEAR_HANDOFF_STARTUP) this.copyLock.unlock();
++        }
+     }
+ 
+     public boolean isQueueEmpty() {
+@@ -178,9 +303,68 @@
+             }
+ 
+             this.stagingBuffer.close();
++        } finally {
++            this.copyLock.unlock();
++        }
++    }
++
++    /**
++     * Resident terrain mesh memory (render thread, takes copyLock): per layer, the vertex bytes of the 28-byte and of
++     * the compact (S5) section-layers, the bytes their heap blocks take (alignment and TLSF rounding included), the
++     * index bytes, and the heap capacity reserved; plus the S5 meshing outcome counters.
++     */
++    @VisibleForDebug
++    public String meshMemoryReport() {
++        StringBuilder sb = new StringBuilder();
++        long totalVertexBytes = 0L;
++        long totalBlockBytes = 0L;
++        long totalUploadBytes = 0L;
++        this.copyLock.lock();
++
++        try {
++            for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
++                SectionRenderDispatcher.SectionUberBuffers buffers = this.chunkUberBuffers.get(layer);
++                long[] v = new long[6];   // full bytes, full blocks, compact bytes, compact blocks, full layers, compact layers
++                int blockStride = layer.pipeline(false).getVertexFormatBinding(0).getVertexSize();
++                buffers.vertexBuffer.forEachAllocation((mesh, allocation) -> {
++                    SectionMesh.SectionDraw draw = mesh.getSectionDraw(layer);
++                    boolean compact = draw != null && draw.compact();
++                    long bytes = draw == null ? 0L : (long)(draw.indexCount() / 6) * 4L * draw.vertexSize(blockStride);
++                    v[compact ? 2 : 0] += bytes;
++                    v[compact ? 3 : 1] += allocation.getSize();
++                    v[compact ? 5 : 4]++;
++                });
++                long[] index = new long[1];
++                buffers.indexBuffer.forEachAllocation((mesh, allocation) -> index[0] += allocation.getSize());
++                long[] outcome = TerrainCompact.meshStats(layer);
++                long[] upload = TerrainCompact.uploadStats(layer);
++                sb.append(String.format(
++                    Locale.ROOT,
++                    "%n  %-11s vertices %7.2f MB (28 B: %5d layers %7.2f MB; 16 B: %5d layers %7.2f MB), heap blocks %7.2f MB, index %6.2f MB, heaps reserved %4d MB; meshed exact %d, snapped %d, fallback position %d / uv %d / light %d; uploaded %d layers, vertex %.2f MB (16 B %.2f MB), index %.2f MB",
++                    layer.label(), (v[0] + v[2]) / 1048576.0, v[4], v[0] / 1048576.0, v[5], v[2] / 1048576.0, (v[1] + v[3] + index[0]) / 1048576.0,
++                    index[0] / 1048576.0, (buffers.vertexBuffer.reservedBytes() + buffers.indexBuffer.reservedBytes()) >> 20,
++                    outcome[TerrainCompact.EXACT], outcome[TerrainCompact.SNAPPED], outcome[TerrainCompact.FAIL_POSITION], outcome[TerrainCompact.FAIL_UV],
++                    outcome[TerrainCompact.FAIL_LIGHT], upload[3], upload[0] / 1048576.0, upload[1] / 1048576.0, upload[2] / 1048576.0
++                ));
++                // TASK E (diagnostics, both pregrow settings): in-frame heap creations vs heaps that took a spare.
++                sb.append("; heaps vertex: ").append(buffers.vertexBuffer.pregrowStats()).append(", index: ").append(buffers.indexBuffer.pregrowStats());
++                totalVertexBytes += v[0] + v[2];
++                totalBlockBytes += v[1] + v[3] + index[0];
++                totalUploadBytes += upload[0] + upload[2];
++            }
+         } finally {
+             this.copyLock.unlock();
+         }
++
++        return String.format(
++                Locale.ROOT,
++                "terrain mesh memory (compact %s, snap %s, lossy %s): vertices %.2f MB, heap blocks %.2f MB; uploaded %.2f MB; max snap: position %.3g block, uv %.3g",
++                TerrainToggles.COMPACT_VERTICES, TerrainCompact.SNAP, TerrainCompact.LOSSY, totalVertexBytes / 1048576.0, totalBlockBytes / 1048576.0,
++                totalUploadBytes / 1048576.0, TerrainCompact.maxPositionError(), TerrainCompact.maxUvError()
++            )
++            + sb
++            + TerrainCompact.debugReport()
++            + (TerrainGreedy.BUILD ? "; " + TerrainGreedy.stats() : "");
+     }
+ 
+     @VisibleForDebug
+@@ -207,6 +391,22 @@
+         private volatile long sectionNode = SectionPos.asLong(-1, -1, -1);
+         private final BlockPos.MutableBlockPos renderOrigin = new BlockPos.MutableBlockPos(-1, -1, -1);
+         private long uploadedTime;
++        /** Round 7 (LodGpu#realListed): this section's current content was in vanilla's draw list with all layers uploaded. */
++        public boolean lodListed;
++        /**
++         * meshSeq of the newest budget/armed mesh shown (copyLock). When near handoff is armed, also records reset
++         * barriers so an old result cannot survive a move away and back to the same coordinates.
++         */
++        private long appliedMeshSeq;
++        /** Armed EMPTY publication's sequence, or 0. copyLock; cleared before reset exposes UNCOMPILED to graph CAS. */
++        private long handoffEmptySeq;
++        private long handoffResetSeq;
++        /** Stage-2 W0b (ChunkStats only): dirty sources of the compile being scheduled (render thread, read by its task). */
++        public int statsSources;
++        /** Stage-2 W0b (ChunkStats only): part hashes of the newest mesh compiled for this node (null = none) and its task start. */
++        long[] statsLastParts;
++        long statsLastStart;
++        int statsLastSources;
+ 
+         public RenderSection(final int index, final long sectionNode) {
+             this.index = index;
+@@ -224,31 +424,71 @@
+ 
+         @Override
+         public void setSectionNode(final long sectionNode) {
+-            this.reset();
+-            this.sectionNode = sectionNode;
+-            int x = SectionPos.sectionToBlockCoord(SectionPos.x(sectionNode));
+-            int y = SectionPos.sectionToBlockCoord(SectionPos.y(sectionNode));
+-            int z = SectionPos.sectionToBlockCoord(SectionPos.z(sectionNode));
+-            this.renderOrigin.set(x, y, z);
+-            this.bb = new AABB(x, y, z, x + 16, y + 16, z + 16);
++            if (NEAR_HANDOFF_STARTUP) SectionRenderDispatcher.this.copyLock.lock();
++
++            try {
++                this.reset();
++                this.sectionNode = sectionNode;
++                int x = SectionPos.sectionToBlockCoord(SectionPos.x(sectionNode));
++                int y = SectionPos.sectionToBlockCoord(SectionPos.y(sectionNode));
++                int z = SectionPos.sectionToBlockCoord(SectionPos.z(sectionNode));
++                this.renderOrigin.set(x, y, z);
++                this.bb = new AABB(x, y, z, x + 16, y + 16, z + 16);
++            } finally {
++                if (NEAR_HANDOFF_STARTUP) SectionRenderDispatcher.this.copyLock.unlock();
++            }
+         }
+ 
+         public SectionMesh getSectionMesh() {
+             return this.sectionMesh.get();
+         }
+ 
++        /**
++         * Called with the dispatcher locked, alongside the frame's mesh/coordinate read. Only a validated compile
++         * can mark EMPTY authoritative: SectionOcclusionGraph's independent UNCOMPILED-to-EMPTY CAS cannot do so.
++         * Reset advances appliedMeshSeq and clears the marker before that CAS can succeed for a new generation.
++         */
++        public long handoffGeneration() { return this.handoffResetSeq; }
++
++        public boolean handoffEmptyReady() {
++            if (!NEAR_HANDOFF_STARTUP) return false;
++            assert SectionRenderDispatcher.this.copyLock.isHeldByCurrentThread();
++            return this.handoffEmptySeq != 0L && this.handoffEmptySeq == this.appliedMeshSeq
++                && this.sectionMesh.get() == CompiledSectionMesh.EMPTY;
++        }
++
+         public void reset() {
+-            this.cancelTasks();
+-            SectionMesh mesh = this.sectionMesh.getAndSet(CompiledSectionMesh.UNCOMPILED);
+-            SectionRenderDispatcher.this.copyLock.lock();
++            if (NEAR_HANDOFF_STARTUP) SectionRenderDispatcher.this.copyLock.lock();
+ 
+             try {
+-                this.releaseSectionMesh(mesh);
++                if (ChunkStats.ENABLED) {
++                    synchronized (this) {
++                        this.statsLastParts = null;
++                    }
++                }
++
++                this.cancelTasks();
++                this.statsSources = 0;
++                if (NEAR_HANDOFF_STARTUP) {
++                    this.appliedMeshSeq = SectionRenderDispatcher.this.nextMeshSeq();
++                    this.handoffEmptySeq = 0L;
++                    this.handoffResetSeq = this.appliedMeshSeq;
++                }
++                SectionMesh mesh = this.sectionMesh.getAndSet(CompiledSectionMesh.UNCOMPILED);
++                meshTouched(this.sectionNode);
++                SectionRenderDispatcher.this.copyLock.lock();
++
++                try {
++                    this.releaseSectionMesh(mesh);
++                } finally {
++                    SectionRenderDispatcher.this.copyLock.unlock();
++                }
++
++                this.uploadedTime = 0L;
++                this.lodListed = false;
+             } finally {
+-                SectionRenderDispatcher.this.copyLock.unlock();
++                if (NEAR_HANDOFF_STARTUP) SectionRenderDispatcher.this.copyLock.unlock();
+             }
+-
+-            this.uploadedTime = 0L;
+         }
+ 
+         public BlockPos getRenderOrigin() {
+@@ -281,6 +521,12 @@
+ 
+         private void cancelTasks() {
+             if (this.lastCompileTask != null) {
++                if (ChunkStats.ENABLED && !this.lastCompileTask.isCompleted.get()) {
++                    ChunkStats.add(ChunkStats.CANCELLED, 1L);
++                    // The replacing compile serves the cancelled one's dirty sources too (reset() clears them).
++                    this.statsSources |= this.lastCompileTask.statsSources;
++                }
++
+                 this.lastCompileTask.cancel();
+                 this.lastCompileTask = null;
+             }
+@@ -292,10 +538,16 @@
+         }
+ 
+         private SectionRenderDispatcher.RenderSection.SectionTask createCompileTask(final RenderSectionRegion region) {
+-            this.cancelTasks();
+-            boolean isRecompile = this.sectionMesh.get() != CompiledSectionMesh.UNCOMPILED;
+-            this.lastCompileTask = new SectionRenderDispatcher.RenderSection.CompileTask(region, isRecompile);
+-            return this.lastCompileTask;
++            if (NEAR_HANDOFF_STARTUP) SectionRenderDispatcher.this.copyLock.lock();
++
++            try {
++                this.cancelTasks();
++                boolean isRecompile = this.sectionMesh.get() != CompiledSectionMesh.UNCOMPILED;
++                this.lastCompileTask = new SectionRenderDispatcher.RenderSection.CompileTask(region, isRecompile);
++                return this.lastCompileTask;
++            } finally {
++                if (NEAR_HANDOFF_STARTUP) SectionRenderDispatcher.this.copyLock.unlock();
++            }
+         }
+ 
+         public void compileAsync(final RenderSectionRegion region) {
+@@ -309,7 +561,9 @@
+         }
+ 
+         private SectionMesh setSectionMesh(final SectionMesh sectionMesh) {
++            if (NEAR_HANDOFF_STARTUP && sectionMesh != CompiledSectionMesh.EMPTY) this.handoffEmptySeq = 0L;
+             SectionMesh oldMesh = this.sectionMesh.getAndSet(sectionMesh);
++            meshTouched(this.sectionNode);
+             SectionRenderDispatcher.this.onSectionMeshUpdate.accept(this);
+             this.updateUploadTime();
+             return oldMesh;
+@@ -317,12 +571,14 @@
+ 
+         public void updateUploadTime() {
+             if (this.uploadedTime == 0L) {
+-                this.uploadedTime = Util.getMillis();
++                // Stage 3 r3: no fade-in where the LOD already showed this chunk (Lod.sectionUploadTime; vanilla time otherwise).
++                this.uploadedTime = Lod.sectionUploadTime(this.sectionNode, Util.getMillis());
+             }
+         }
+ 
+         private void releaseSectionMesh(final SectionMesh oldMesh) {
+             oldMesh.close();
++            meshTouched(this.sectionNode);
+ 
+             for (SectionRenderDispatcher.SectionUberBuffers buffers : SectionRenderDispatcher.this.chunkUberBuffers.values()) {
+                 buffers.vertexBuffer.removeAllocation(oldMesh);
+@@ -336,7 +592,7 @@
+             );
+         }
+ 
+-        private void checkSectionMesh(final CompiledSectionMesh compiledSectionMesh) {
++        private void checkSectionMesh(final CompiledSectionMesh compiledSectionMesh, final long compiledForNode, final long meshSeq) {
+             boolean allBuffersUpdated = true;
+ 
+             for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
+@@ -348,26 +604,57 @@
+             }
+ 
+             if (allBuffersUpdated && this.sectionMesh.get() != compiledSectionMesh) {
++                if (NEAR_HANDOFF_STARTUP || SectionRenderDispatcher.this.uploadBudget != null) {
++                    if (compiledForNode != this.sectionNode || meshSeq < this.appliedMeshSeq) {
++                        // A newer result, coordinate change or armed reset barrier overtook this upload.
++                        this.releaseSectionMesh(compiledSectionMesh);
++                        return;
++                    }
++
++                    this.appliedMeshSeq = meshSeq;
++                }
++
+                 SectionMesh oldMesh = this.setSectionMesh(compiledSectionMesh);
+                 this.releaseSectionMesh(oldMesh);
+             }
+         }
+ 
+-        private void vertexBufferUploadCallback(final CompiledSectionMesh sectionMesh, final ChunkSectionLayer layer) {
++        private void vertexBufferUploadCallback(
++            final CompiledSectionMesh sectionMesh, final ChunkSectionLayer layer, final long compiledForNode, final long meshSeq
++        ) {
+             sectionMesh.setVertexBufferUploaded(layer);
+-            this.checkSectionMesh(sectionMesh);
++            this.checkSectionMesh(sectionMesh, compiledForNode, meshSeq);
+         }
+ 
+-        private void indexBufferUploadCallback(final CompiledSectionMesh sectionMesh, final ChunkSectionLayer layer, final boolean sortedIndexBuffer) {
++        private void indexBufferUploadCallback(
++            final CompiledSectionMesh sectionMesh, final ChunkSectionLayer layer, final boolean sortedIndexBuffer, final long compiledForNode,
++            final long meshSeq
++        ) {
+             sectionMesh.setIndexBufferUploaded(layer);
+             if (!sortedIndexBuffer) {
+-                this.checkSectionMesh(sectionMesh);
++                this.checkSectionMesh(sectionMesh, compiledForNode, meshSeq);
+             }
+         }
+ 
++        /** Vanilla signature (also used by tools/TerrainDrawListBench.java): a mesh compiled now, for the current node. */
+         private boolean addSectionBuffersToUberBuffer(
+             final ChunkSectionLayer layer, final CompiledSectionMesh key, final @Nullable ByteBuffer vertexBuffer, final @Nullable ByteBuffer indexBuffer
+         ) {
++            return this.addSectionBuffersToUberBuffer(layer, key, vertexBuffer, indexBuffer, this.sectionNode, SectionRenderDispatcher.this.nextMeshSeq());
++        }
++
++        /**
++         * {@code compiledForNode}: the section node the mesh was compiled for; {@code meshSeq}: its CompileTask's sequence
++         * number (budget-mode ordering, or both modes when near handoff is armed).
++         */
++        private boolean addSectionBuffersToUberBuffer(
++            final ChunkSectionLayer layer,
++            final CompiledSectionMesh key,
++            final @Nullable ByteBuffer vertexBuffer,
++            final @Nullable ByteBuffer indexBuffer,
++            final long compiledForNode,
++            final long meshSeq
++        ) {
+             boolean success = true;
+             SectionRenderDispatcher.this.copyLock.lock();
+ 
+@@ -377,19 +664,55 @@
+                     SectionRenderDispatcher.SectionUberBuffers sectionBuffers = SectionRenderDispatcher.this.chunkUberBuffers.get(layer);
+                     assert sectionBuffers != null;
+                     if (vertexBuffer != null) {
+-                        UberGpuBuffer.UploadCallback<CompiledSectionMesh> callback = mesh -> this.vertexBufferUploadCallback(mesh, layer);
++                        UberGpuBuffer.UploadCallback<CompiledSectionMesh> callback = mesh -> this.vertexBufferUploadCallback(
++                            mesh, layer, compiledForNode, meshSeq
++                        );
+                         success &= sectionBuffers.vertexBuffer.addAllocation(key, callback, vertexBuffer);
+                     }
+ 
+                     if (indexBuffer != null) {
+                         boolean sortedIndexBuffer = vertexBuffer == null;
+-                        UberGpuBuffer.UploadCallback<CompiledSectionMesh> callback = mesh -> this.indexBufferUploadCallback(mesh, layer, sortedIndexBuffer);
+-                        success &= sectionBuffers.indexBuffer.addAllocation(key, callback, indexBuffer);
++                        // R9-1 (TranslucentFacing): [vanilla sorted list][the same without buckets facing away], with
++                        // the kept count and dropped mask published in this upload's callback (same pass as its offset).
++                        TranslucentFacing.Extended extended = null;
++                        if (layer == ChunkSectionLayer.TRANSLUCENT && TerrainToggles.TRANSLUCENT_FACING && draw.indexType() != null) {
++                            Vec3 camera = SectionRenderDispatcher.this.cameraPosition.get();
++                            extended = TranslucentFacing.extend(
++                                indexBuffer,
++                                draw.indexType(),
++                                draw.info(),
++                                camera.x - SectionPos.sectionToBlockCoord(SectionPos.x(compiledForNode)),
++                                camera.y - SectionPos.sectionToBlockCoord(SectionPos.y(compiledForNode)),
++                                camera.z - SectionPos.sectionToBlockCoord(SectionPos.z(compiledForNode))
++                            );
++                        }
++
++                        int keptIndexCount = extended != null ? extended.keptIndexCount() : 0;
++                        int droppedMask = extended != null ? extended.droppedMask() : 0;
++                        boolean facingLayer = layer == ChunkSectionLayer.TRANSLUCENT;
++                        UberGpuBuffer.UploadCallback<CompiledSectionMesh> callback = mesh -> {
++                            if (facingLayer) {
++                                TerrainDrawList.setTranslucentFacing(mesh.hot, layer.ordinal(), keptIndexCount, droppedMask);
++                            }
++
++                            this.indexBufferUploadCallback(mesh, layer, sortedIndexBuffer, compiledForNode, meshSeq);
++                        };
++                        try {
++                            success &= sectionBuffers.indexBuffer.addAllocation(key, callback, extended != null ? extended.buffer() : indexBuffer);
++                        } finally {
++                            if (extended != null) {
++                                TranslucentFacing.free(extended);
++                            }
++                        }
+                     } else {
+                         key.setIndexBufferUploaded(layer);
+                     }
+                 }
+ 
++                if (success && draw != null && TerrainToggles.MESH_STATS_SECONDS > 0) {
++                    TerrainCompact.countUpload(layer, vertexBuffer, indexBuffer, draw.compact());
++                }
++
+                 if (!success && RenderSystem.isOnRenderThread()) {
+                     SectionRenderDispatcher.this.uploadTerrainBuffersToGpu();
+                 }
+@@ -403,11 +726,18 @@
+         private class CompileTask extends SectionRenderDispatcher.RenderSection.SectionTask {
+             private final RenderSectionRegion region;
+             private final long startTimeNs;
++            /** Creation order of budget/armed meshes, including no-upload results; otherwise 0. */
++            private final long meshSeq;
+ 
++            /** Stage-2 W0b: the dirty sources this compile serves (ChunkStats only). */
++            private final int statsSources;
++
+             public CompileTask(final RenderSectionRegion region, final boolean isRecompile) {
+                 super(isRecompile);
++                this.statsSources = RenderSection.this.statsSources;
+                 this.region = region;
+                 this.startTimeNs = Util.getNanos();
++                this.meshSeq = SectionRenderDispatcher.this.nextMeshSeq();
+             }
+ 
+             @Override
+@@ -425,14 +755,23 @@
+                 Vec3 cameraPos = SectionRenderDispatcher.this.cameraPosition.get();
+ 
+                 SectionCompiler.Results results;
++                long compileStart = ChunkStats.ENABLED ? System.nanoTime() : 0L;
+                 try (Zone ignored = Profiler.get().zone("Compile Section")) {
+                     results = SectionRenderDispatcher.this.sectionCompiler
+                         .compile(sectionPos, this.region, RenderSection.this.createVertexSorting(sectionPos, cameraPos), buffers);
+                 }
+ 
++                if (ChunkStats.ENABLED) {
++                    this.countStats(results, System.nanoTime() - compileStart, sectionNode);
++                }
++
+                 TranslucencyPointOfView translucencyPointOfView = TranslucencyPointOfView.of(cameraPos, sectionNode);
+                 CompiledSectionMesh compiledSectionMesh = new CompiledSectionMesh(translucencyPointOfView, results, this.startTimeNs);
+                 if (results.renderedLayers.isEmpty()) {
++                    if (NEAR_HANDOFF_STARTUP || SectionRenderDispatcher.this.uploadBudget != null) {
++                        return this.setEmptyBudgeted(results.blockEntities.isEmpty() ? CompiledSectionMesh.EMPTY : compiledSectionMesh, sectionNode);
++                    }
++
+                     SectionMesh oldMesh = RenderSection.this.setSectionMesh(results.blockEntities.isEmpty() ? CompiledSectionMesh.EMPTY : compiledSectionMesh);
+                     SectionRenderDispatcher.this.copyLock.lock();
+ 
+@@ -446,6 +785,15 @@
+                 } else {
+                     for (Entry<ChunkSectionLayer, MeshData> entry : results.renderedLayers.entrySet()) {
+                         MeshData meshData = entry.getValue();
++                        // S5: the compact bytes when the layer was transcoded (a view of meshData's buffer).
++                        ByteBuffer vertexBytes = results.compactVertices.get(entry.getKey());
++                        if (vertexBytes == null) {
++                            vertexBytes = results.greedyVertices.get(entry.getKey());   // round 12 Part B prototype
++                        }
++                        if (vertexBytes == null) {
++                            vertexBytes = meshData.vertexBuffer();
++                        }
++
+                         boolean success = false;
+ 
+                         while (!success) {
+@@ -463,7 +811,7 @@
+                             }
+ 
+                             success = RenderSection.this.addSectionBuffersToUberBuffer(
+-                                entry.getKey(), compiledSectionMesh, meshData.vertexBuffer(), meshData.indexBuffer()
++                                entry.getKey(), compiledSectionMesh, vertexBytes, meshData.indexBuffer(), sectionNode, this.meshSeq
+                             );
+                             if (!success && !RenderSystem.isOnRenderThread()) {
+                                 Thread.onSpinWait();
+@@ -477,9 +825,91 @@
+                 }
+             }
+ 
++            /** Stage-2 W0b: compile time, empty results, uploaded bytes and identical recompiles (ChunkStats; counting only). */
++            private void countStats(final SectionCompiler.Results results, final long compileNs, final long sectionNode) {
++                ChunkStats.add(ChunkStats.COMPILES, 1L);
++                ChunkStats.add(ChunkStats.COMPILE_NS, compileNs);
++                if (results.renderedLayers.isEmpty()) {
++                    ChunkStats.add(ChunkStats.COMPILE_EMPTY, 1L);
++                }
++
++                long bytes = 0L;
++                for (Entry<ChunkSectionLayer, MeshData> entry : results.renderedLayers.entrySet()) {
++                    ByteBuffer v = uploadedVertexBytes(results, entry.getKey());
++                    bytes += v == null ? 0 : v.remaining();
++                    ByteBuffer i = entry.getValue().indexBuffer();
++                    bytes += i == null ? 0 : i.remaining();
++                }
++
++                ChunkStats.add(ChunkStats.UPLOAD_BYTES, bytes);
++                long[] parts = ChunkStats.meshHash(results, layer -> uploadedVertexBytes(results, ChunkSectionLayer.values()[layer]));
++                // Never acquire copyLock while holding this statistics monitor: reset takes them in the other order.
++                synchronized (RenderSection.this) {
++                    if (sectionNode != RenderSection.this.sectionNode) {
++                        return;
++                    }
++
++                    // Compare with the newest earlier compile (tasks can finish out of order).
++                    long[] previous = RenderSection.this.statsLastParts;
++                    int previousSources = RenderSection.this.statsLastSources;
++                    long previousStart = RenderSection.this.statsLastStart;
++                    if (this.startTimeNs >= RenderSection.this.statsLastStart || previous == null) {
++                        RenderSection.this.statsLastParts = parts;
++                        RenderSection.this.statsLastStart = this.startTimeNs;
++                        RenderSection.this.statsLastSources = this.statsSources;
++                    }
++
++                    if (this.isRecompile()) {
++                        boolean identical = previous != null && java.util.Arrays.equals(previous, parts);
++                        ChunkStats.recompileDone(this.statsSources, identical);
++                        if (!identical && previous != null && this.statsSources == 1 << ChunkStats.SRC_SAME_RENDER) {
++                            System.out.println("[chunkstats] sameRender-only recompile differs at " + net.minecraft.core.SectionPos.of(sectionNode)
++                                + " (previous compile: sources " + previousSources + ", started " + (this.startTimeNs - previousStart) / 1000000L + " ms earlier)"
++                                + ": before " + java.util.Arrays.toString(previous) + " after " + java.util.Arrays.toString(parts));
++                        }
++                    }
++                }
++            }
++
++            /**
++             * Budget no-upload result (EMPTY, or block entities only); also used without a budget when near handoff is
++             * armed. Only then do cancellation, reset and movement also take copyLock, making these freshness checks
++             * atomic with publication. OFF retains the prior budget checks and cancellation behavior.
++             */
++            private SectionRenderDispatcher.RenderSection.SectionTask.SectionTaskResult setEmptyBudgeted(final SectionMesh mesh, final long compiledForNode) {
++                SectionRenderDispatcher.this.copyLock.lock();
++
++                try {
++                    if (NEAR_HANDOFF_STARTUP && this.isCancelled.get()) {
++                        RenderSection.this.releaseSectionMesh(mesh);
++                        return SectionRenderDispatcher.RenderSection.SectionTask.SectionTaskResult.CANCELLED;
++                    }
++
++                    if (compiledForNode != RenderSection.this.sectionNode || this.meshSeq < RenderSection.this.appliedMeshSeq) {
++                        RenderSection.this.releaseSectionMesh(mesh);
++                        return SectionRenderDispatcher.RenderSection.SectionTask.SectionTaskResult.SUCCESSFUL;
++                    }
++
++                    RenderSection.this.appliedMeshSeq = this.meshSeq;
++                    if (NEAR_HANDOFF_STARTUP) RenderSection.this.handoffEmptySeq = mesh == CompiledSectionMesh.EMPTY ? this.meshSeq : 0L;
++                    SectionMesh oldMesh = RenderSection.this.setSectionMesh(mesh);
++                    RenderSection.this.releaseSectionMesh(oldMesh);
++                } finally {
++                    SectionRenderDispatcher.this.copyLock.unlock();
++                }
++
++                return SectionRenderDispatcher.RenderSection.SectionTask.SectionTaskResult.SUCCESSFUL;
++            }
++
+             @Override
+             public void cancel() {
+-                this.isCancelled.compareAndSet(false, true);
++                if (NEAR_HANDOFF_STARTUP) SectionRenderDispatcher.this.copyLock.lock();
++
++                try {
++                    this.isCancelled.compareAndSet(false, true);
++                } finally {
++                    if (NEAR_HANDOFF_STARTUP) SectionRenderDispatcher.this.copyLock.unlock();
++                }
+             }
+         }
+ 
+@@ -498,6 +928,10 @@
+                 }
+ 
+                 MeshData.SortState state = this.compiledSectionMesh.getTransparencyState();
++                if (ChunkStats.ENABLED) {
++                    ChunkStats.add(ChunkStats.RESORTS, 1L);
++                }
++
+                 if (state != null && !this.compiledSectionMesh.isEmpty(ChunkSectionLayer.TRANSLUCENT)) {
+                     Vec3 cameraPos = SectionRenderDispatcher.this.cameraPosition.get();
+                     long sectionNode = RenderSection.this.sectionNode;
+@@ -520,8 +954,9 @@
+                             return SectionRenderDispatcher.RenderSection.SectionTask.SectionTaskResult.CANCELLED;
+                         }
+ 
++                        // Index-only re-sort of the shown mesh: its callback never replaces the mesh, so meshSeq is unused.
+                         success = RenderSection.this.addSectionBuffersToUberBuffer(
+-                            ChunkSectionLayer.TRANSLUCENT, this.compiledSectionMesh, null, indexBuffer.byteBuffer()
++                            ChunkSectionLayer.TRANSLUCENT, this.compiledSectionMesh, null, indexBuffer.byteBuffer(), sectionNode, 0L
+                         );
+                         if (!success && !RenderSystem.isOnRenderThread()) {
+                             Thread.onSpinWait();
+@@ -570,6 +1005,21 @@
+         }
+     }
+ 
++    /** The vertex bytes a compile task uploads for {@code layer}: compact (S5), greedy (R12-G) or the MeshData's own. */
++    static @Nullable ByteBuffer uploadedVertexBytes(final SectionCompiler.Results results, final ChunkSectionLayer layer) {
++        ByteBuffer vertexBytes = results.compactVertices.get(layer);
++        if (vertexBytes == null) {
++            vertexBytes = results.greedyVertices.get(layer);
++        }
++
++        if (vertexBytes == null) {
++            MeshData mesh = results.renderedLayers.get(layer);
++            vertexBytes = mesh == null ? null : mesh.vertexBuffer();
++        }
++
++        return vertexBytes;
++    }
++
+     public record RenderSectionBufferSlice(GpuBuffer vertexBuffer, long vertexBufferOffset, @Nullable GpuBuffer indexBuffer, long indexBufferOffset) {
+     }
+ 

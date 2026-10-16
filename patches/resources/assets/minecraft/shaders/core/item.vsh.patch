@@ -1,0 +1,29 @@
+--- a/assets/minecraft/shaders/core/item.vsh
++++ b/assets/minecraft/shaders/core/item.vsh
+@@ -34,6 +34,13 @@
+ #ifdef GLINT
+ layout(location = 6) out vec2 texCoordGlint;
+ #endif
++#if defined(TESSERA) && !defined(OIT_ALPHA_ONLY)
++// Stage 4 (Tessera): what the fragment needs to light the item with Tessera's model (as core/entity)
++layout(location = 8) out vec3 tesseraP;
++layout(location = 9) out vec3 tesseraN;
++layout(location = 10) out vec2 tesseraLm;
++layout(location = 11) out vec4 tesseraBase;
++#endif
+ 
+ void main() {
+     gl_Position = ProjMat * ModelViewMat * vec4(Position, 1.0);
+@@ -49,6 +56,12 @@
+     #endif
+ 
+     texCoord0 = UV0;
++#if defined(TESSERA) && !defined(OIT_ALPHA_ONLY)
++    tesseraP = Position;
++    tesseraN = Normal;
++    tesseraLm = clamp(vec2(UV2) / 240.0, 0.0, 1.0);
++    tesseraBase = Color;
++#endif
+     #ifdef GLINT
+     #ifdef GLINT_SPECIAL
+     texCoordGlint = (TextureMat * vec4(UV3, 0.0, 1.0)).xy;

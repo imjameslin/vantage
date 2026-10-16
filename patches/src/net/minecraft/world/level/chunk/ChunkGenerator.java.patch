@@ -1,0 +1,36 @@
+--- a/net/minecraft/world/level/chunk/ChunkGenerator.java
++++ b/net/minecraft/world/level/chunk/ChunkGenerator.java
+@@ -350,6 +350,14 @@
+         }
+     }
+ 
++    private static boolean hiddenFromAfar(final int stepIndex, final PlacedFeature feature) {
++        if (stepIndex == GenerationStep.Decoration.UNDERGROUND_DECORATION.ordinal()) {
++            return true;
++        }
++        // the ores (small veins, many tries: most of the feature time); the big blobs (dirt, gravel, granite, ...) show on cliffs
++        return feature.feature().value() instanceof net.minecraft.world.level.levelgen.feature.AbstractOreFeature ore && ore.size() < 33;
++    }
++
+     public void applyBiomeDecoration(final WorldGenLevel level, final ChunkAccess chunk, final StructureManager structureManager) {
+         ChunkPos centerPos = chunk.getPos();
+         if (!SharedConstants.debugVoidTerrain(centerPos)) {
+@@ -372,6 +380,8 @@
+             possibleBiomes.retainAll(this.biomeSource.possibleBiomes());
+             int featureStepCount = featureList.size();
+             FeaturePlacer placer = new FeaturePlacer(level, this);
++            // Farsight far terrain: what can't be seen from afar is skipped (each feature has its own seed, the rest is unchanged)
++            boolean farOnly = chunk instanceof LodProtoChunk;
+ 
+             try {
+                 Registry<PlacedFeature> featureRegistry = level.registryAccess().lookupOrThrow(Registries.PLACED_FEATURE);
+@@ -422,6 +432,9 @@
+                         for (int featureIndex = 0; featureIndex < numberOfFeaturesInStep; featureIndex++) {
+                             int globalIndexOfFeature = indexArray[featureIndex];
+                             PlacedFeature feature = stepFeatureData.features().get(globalIndexOfFeature);
++                            if (farOnly && hiddenFromAfar(stepIndex, feature)) {
++                                continue;
++                            }
+                             Supplier<String> currentlyGenerating = () -> featureRegistry.getResourceKey(feature)
+                                 .map(Object::toString)
+                                 .orElseGet(feature::toString);

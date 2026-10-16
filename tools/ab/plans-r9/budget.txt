@@ -1,0 +1,16 @@
+# Round 9 cost budget: in-session skip attribution (A = full frame, B = draws of the named pipelines dropped,
+# -Dmcmetal.skipPipelines + MetalRenderPass#skipOn). heavy preset held at the median view (yaw 232.5); spin for totals.
+# Client build/client-r9d0.jar = r8 + the abab-switchable skip gate (diagnostics only). ABAB_BENCH_JAR=build/bench-r6b.jar
+abab bud-h-terrain build/client-r9d0.jar --jvm=-Dmcmetal.skipPipelines=_terrain --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalRenderPass#skipOn=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab bud-h-all build/client-r9d0.jar --jvm=-Dmcmetal.skipPipelines=* --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalRenderPass#skipOn=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab bud-h-solid build/client-r9d0.jar --jvm=-Dmcmetal.skipPipelines=solid_terrain --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalRenderPass#skipOn=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab bud-h-cutout build/client-r9d0.jar --jvm=-Dmcmetal.skipPipelines=cutout_terrain --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalRenderPass#skipOn=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab bud-h-transl build/client-r9d0.jar --jvm=-Dmcmetal.skipPipelines=translucent_terrain --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalRenderPass#skipOn=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab bud-h-sky build/client-r9d0.jar --jvm=-Dmcmetal.skipPipelines=sky,stars,celestial,sunrise_sunset --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalRenderPass#skipOn=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab bud-h-clouds build/client-r9d0.jar --jvm=-Dmcmetal.skipPipelines=clouds --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalRenderPass#skipOn=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab bud-h-gui build/client-r9d0.jar --jvm=-Dmcmetal.skipPipelines=gui,text,crosshair,vignette --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalRenderPass#skipOn=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab bud-h-entity build/client-r9d0.jar --jvm=-Dmcmetal.skipPipelines=entity,item --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalRenderPass#skipOn=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab bud-h-misc build/client-r9d0.jar --jvm=-Dmcmetal.skipPipelines=particle,weather,lines --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalRenderPass#skipOn=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab bud-s-terrain build/client-r9d0.jar --jvm=-Dmcmetal.skipPipelines=_terrain --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalRenderPass#skipOn=false|true
+abab bud-s-all build/client-r9d0.jar --jvm=-Dmcmetal.skipPipelines=* --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.MetalRenderPass#skipOn=false|true
+classic bud-ft-y232 build/client-r9d0.jar --bench-prop frameTrace=true --bench-prop yaw=232.5 --bench-prop spin=1000000

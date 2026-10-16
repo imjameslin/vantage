@@ -1,0 +1,195 @@
+--- a/net/minecraft/client/Minecraft.java
++++ b/net/minecraft/client/Minecraft.java
+@@ -1,3 +1,13 @@
++// Patched copy of the vanilla 26.3 class (OWNER: I5, Metal backend game integration). Differences from vanilla:
++//  - crash recovery: an unclean start with METAL resets the preference to Default like VULKAN (and on macOS, where
++//    Default tries Metal first, uses OpenGL for that session like an unclean Default start);
++//  - the startup VulkanBackend.checkBackendAvailable() probe is skipped when Metal is tried first (Default on macOS);
++//  - delayTextureReload(): explicit Supplier cast for a decompiler artifact (same bytecode target as vanilla);
++//  - Metal late frame throttle (-Dmcmetal.lateThrottle, default on since round 5; CONTRACT.md 16.R5-A / 16.R5-FIN): runTick's tick
++//    bundle runs before the frames-in-flight wait (runTickBundleLateThrottle -> lateFrameThrottle: GPU failures crash as
++//    "Render Frame", input is pumped again after a wait that blocked), renderFrame starts with the throttle point;
++//  - stage-2 W7 instant UI transitions (-Dmc.ui.instantTransitions, default on; CONTRACT.md 16.W7): doWorldLoad's
++//    LevelLoadTracker close delay comes from UiTransitions.levelLoadCloseDelayMs (vanilla: 500 ms for a new world, else 0).
+ package net.minecraft.client;
+ 
+ import com.google.common.collect.ImmutableList;
+@@ -427,6 +437,14 @@
+         this.fixerUpper = DataFixers.getDataFixer();
+         this.gameThread = Thread.currentThread();
+         this.options = new Options(this, this.gameDirectory);
++        // Farsight and the shaders are chosen at startup (their pipelines and threads are set up once): the Video Settings
++        // toggles, unless a -Dmc.lod / -Dmc.shaders launch flag says otherwise
++        if (System.getProperty("mc.lod") == null) {
++            System.setProperty("mc.lod", String.valueOf(this.options.farsight().get()));
++        }
++        if (System.getProperty("mc.shaders") == null) {
++            System.setProperty("mc.shaders", String.valueOf(this.options.tesseraShaders().get()));
++        }
+         this.debugEntries = new DebugScreenEntryList(this.gameDirectory, this.fixerUpper);
+         boolean lastStartWasClean = this.options.startedCleanly;
+         this.options.startedCleanly = false;
+@@ -463,11 +481,17 @@
+                 forcedGraphicsApi.getSerializedName()
+             );
+         } else if (!lastStartWasClean) {
+-            if (this.options.preferredGraphicsBackend().get() == PreferredGraphicsApi.VULKAN) {
++            // Metal backend patch: METAL is reset to Default exactly like VULKAN (saved). On macOS Default tries Metal
++            // first, so this session also falls back to OpenGL, like an unclean Default start does below; the session
++            // after the next clean start uses Default again. Other values and other platforms behave as in vanilla.
++            PreferredGraphicsApi lastGraphicsApi = this.options.preferredGraphicsBackend().get();
++            if (lastGraphicsApi == PreferredGraphicsApi.VULKAN || lastGraphicsApi == PreferredGraphicsApi.METAL) {
+                 LOGGER.warn("Detected unexpected shutdown during last game startup: resetting preferred graphics API to Default");
+                 this.options.preferredGraphicsBackend().set(PreferredGraphicsApi.DEFAULT);
+                 this.options.save();
+-            } else if (this.options.preferredGraphicsBackend().get() == PreferredGraphicsApi.DEFAULT) {
++            }
++
++            if (lastGraphicsApi == PreferredGraphicsApi.DEFAULT || lastGraphicsApi == PreferredGraphicsApi.METAL && Util.getPlatform() == Util.OS.OSX) {
+                 LOGGER.warn("Detected unexpected shutdown during last game startup: forcing preferred graphics API to OpenGL");
+                 this.options.preferredGraphicsBackend().set(PreferredGraphicsApi.OPENGL);
+             }
+@@ -475,7 +499,10 @@
+ 
+         PreferredGraphicsApi preferredGraphicsBackend = forcedGraphicsApi == null ? this.options.preferredGraphicsBackend().get() : forcedGraphicsApi;
+         GpuBackend[] backendsToTry = preferredGraphicsBackend.getBackendsToTry();
+-        if (preferredGraphicsBackend == PreferredGraphicsApi.DEFAULT) {
++        if (preferredGraphicsBackend == PreferredGraphicsApi.DEFAULT
++            && !(backendsToTry.length > 0 && backendsToTry[0] instanceof com.mojang.renderpearl.backend.metal.MetalBackend)) {
++            // Metal backend patch: the Vulkan probe (telemetry only) creates a MoltenVK instance and device; skipped when
++            // Metal is tried first. A Metal failure still records its BackendCreationException in the loop below.
+             this.backendCreationException = VulkanBackend.checkBackendAvailable();
+         }
+ 
+@@ -782,6 +809,8 @@
+ 
+     private void onGameLoadFinished(final @Nullable GameLoadCookie cookie) {
+         Runnable showScreen = this.gui.buildInitialScreens(cookie);
++        // Fabric: notice for superseded rendering mods (net.minecraft.client.compat.ModCompat; no-op without Fabric).
++        showScreen = net.minecraft.client.compat.ModCompat.wrapInitialScreens(this, showScreen, cookie != null && cookie.quickPlayData().isEnabled());
+         GameLoadTimesEvent.INSTANCE.endStep(TelemetryProperty.LOAD_TIME_LOADING_OVERLAY_MS);
+         GameLoadTimesEvent.INSTANCE.endStep(TelemetryProperty.LOAD_TIME_TOTAL_TIME_MS);
+         GameLoadTimesEvent.INSTANCE.send(this.telemetryManager.getOutsideSessionSender());
+@@ -1178,7 +1207,10 @@
+         this.playerSocialManager.getPresenceHandler().tick();
+         int ticksToDo = advanceGameTime ? this.deltaTracker.advanceGameTime(Util.getMillis()) : 0;
+         ProfilerFiller profiler = Profiler.get();
+-        if (advanceGameTime) {
++        if (com.mojang.renderpearl.backend.metal.MetalFrameThrottle.active()) {
++            // Metal late frame throttle (-Dmcmetal.lateThrottle, docs/metal/CONTRACT.md 16.R5-A); off: vanilla below.
++            this.runTickBundleLateThrottle(advanceGameTime, ticksToDo, profiler);
++        } else if (advanceGameTime) {
+             try (Gizmos.TemporaryCollection ignored = this.collectPerTickGizmos()) {
+                 profiler.push("scheduledPacketProcessing");
+                 this.packetProcessor.processQueuedPackets();
+@@ -1242,7 +1274,91 @@
+         this.deltaTracker.updateFrozenState(!this.isLevelRunningNormally());
+     }
+ 
++    /**
++     * Metal late frame throttle (docs/metal/CONTRACT.md 16.R5-A, results/TAIL-ANALYSIS.md S1): runTick's tick bundle in the
++     * order packets -> tasks -> tick() x n -> gizmo drain -> frame throttle -> textureManager.tick(). The frames-in-flight
++     * wait comes after the client tick, so the tick overlaps the GPU's work instead of following the wait. The texture tick
++     * records the next frame's animation passes, so it stays behind the throttle; its condition is evaluated where vanilla
++     * evaluates it (after the tasks, before the ticks). Animation steps and the client tick are independent of each other.
++     */
++    private void runTickBundleLateThrottle(final boolean advanceGameTime, final int ticksToDo, final ProfilerFiller profiler) {
++        if (!advanceGameTime) {
++            this.lateFrameThrottle(profiler);
++            return;
++        }
++
++        try (Gizmos.TemporaryCollection ignored = this.collectPerTickGizmos()) {
++            profiler.push("scheduledPacketProcessing");
++            this.packetProcessor.processQueuedPackets();
++            profiler.popPush("scheduledExecutables");
++            this.runAllTasks();
++            profiler.pop();
++        }
++
++        profiler.push("tick");
++        boolean tickTextures = ticksToDo > 0 && this.isLevelRunningNormally();
++
++        for (int i = 0; i < Math.min(10, ticksToDo); i++) {
++            profiler.incrementCounter("clientTick");
++
++            try (Gizmos.TemporaryCollection ignored = this.collectPerTickGizmos()) {
++                this.tick();
++            }
++        }
++
++        if (ticksToDo > 0 && (this.level == null || this.level.tickRateManager().runsNormally())) {
++            this.drainedLatestTickGizmos = this.perTickGizmos.drainGizmos();
++        }
++
++        this.lateFrameThrottle(profiler);
++        if (tickTextures) {
++            profiler.push("textures");
++            this.textureManager.tick();
++            profiler.pop();
++        }
++
++        profiler.pop();
++    }
++
++    /**
++     * The late throttle point (docs/metal/CONTRACT.md 16.R5-A). A GPU failure (timeout, command-buffer error, device
++     * loss; also one recorded by a guard inside a task or packet handler) crashes with the same "Render Frame" report as
++     * an exception thrown by renderFrame, where the old submit() threw it. When the wait blocked, input is pumped again:
++     * mouse motion that arrived during the wait reaches handleAccumulatedMovement in this frame, as it would after the
++     * old submit() wait (vanilla's next pollEvents); key and click events keep their place relative to the client ticks.
++     */
++    private void lateFrameThrottle(final ProfilerFiller profiler) {
++        profiler.push("frameThrottle");
++        boolean blocked;
++
++        try {
++            blocked = com.mojang.renderpearl.backend.metal.MetalFrameThrottle.frameThrottle();
++        } catch (Exception e) {
++            CrashReport report = CrashReport.forThrowable(e, "Render Frame");
++            CrashReportCategory manualCrashDetails = report.addCategory("Render Frame Details");
++            NativeModuleLister.addCrashSection(manualCrashDetails);
++            manualCrashDetails.setDetail("Post effects", this.gameRenderer.getRequestedPostEffects());
++            throw new ReportedException(report);
++        } finally {
++            profiler.pop();
++        }
++
++        if (blocked) {
++            profiler.push("pollEvents");
++            RenderSystem.pollEvents(this.sdlEventHandler);
++            profiler.pop();
++        }
++    }
++
+     public void renderFrame(final boolean advanceGameTime) {
++        // Metal late frame throttle (docs/metal/CONTRACT.md 16.R5-A): callers other than runTick (startup, world-load
++        // loops) wait here; after runTick's throttle point this is a no-op. Does nothing when the throttle is off.
++        com.mojang.renderpearl.backend.metal.MetalFrameThrottle.frameThrottle();
++        if (com.mojang.renderpearl.backend.metal.MetalFarPrograms.REQUESTED) {
++            // Image consumers can finish after world close; retire geometry on menu/startup frames too.
++            com.mojang.renderpearl.backend.metal.MetalFarGeometryPins.pollReleases();
++            net.minecraft.client.renderer.chunk.LodAsyncProducerProbe.pollAll();
++        }
+         if (!this.windowSurface.isAcquired()) {
+             ProfilerFiller profiler = Profiler.get();
+ 
+@@ -2036,7 +2152,7 @@
+     ) {
+         this.disconnectWithProgressScreen();
+         Instant worldLoadStart = Instant.now();
+-        LevelLoadTracker loadTracker = new LevelLoadTracker(newWorld ? 500L : 0L);
++        LevelLoadTracker loadTracker = new LevelLoadTracker(net.minecraft.client.gui.screens.UiTransitions.levelLoadCloseDelayMs(newWorld));
+         LevelLoadingScreen screen = new LevelLoadingScreen(loadTracker, LevelLoadingScreen.Reason.OTHER);
+         this.gui.setScreen(screen);
+         int chunkStatusViewRadius = Math.max(5, 3) + ChunkLevel.RADIUS_AROUND_FULL_CHUNK + 1;
+@@ -2575,7 +2691,8 @@
+     }
+ 
+     public CompletableFuture<Void> delayTextureReload() {
+-        return this.<CompletableFuture<Void>>submit(this::reloadResourcePacks).thenCompose(result -> (CompletionStage<Void>)result);
++        return this.<CompletableFuture<Void>>submit((java.util.function.Supplier<CompletableFuture<Void>>)this::reloadResourcePacks)
++            .thenCompose(result -> (CompletionStage<Void>)result);
+     }
+ 
+     public void updateReportEnvironment(final ReportEnvironment environment) {

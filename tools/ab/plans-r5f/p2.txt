@@ -1,0 +1,13 @@
+# Finalize step 1: 4 more WIN vs ARD pairs (pregrow) and WIN vs WIN without the fast-tick pair (ARP, check verdict 5), travel, traced; MEMLOG=1
+travel r5f-p2-tr-WIN-1 WIN --bench-prop frameTrace=true
+travel r5f-p2-tr-ARD-1 ARD --bench-prop frameTrace=true
+travel r5f-p2-tr-ARP-1 ARP --bench-prop frameTrace=true
+travel r5f-p2-tr-ARP-2 ARP --bench-prop frameTrace=true
+travel r5f-p2-tr-WIN-2 WIN --bench-prop frameTrace=true
+travel r5f-p2-tr-ARD-2 ARD --bench-prop frameTrace=true
+travel r5f-p2-tr-ARD-3 ARD --bench-prop frameTrace=true
+travel r5f-p2-tr-ARP-3 ARP --bench-prop frameTrace=true
+travel r5f-p2-tr-WIN-3 WIN --bench-prop frameTrace=true
+travel r5f-p2-tr-ARP-4 ARP --bench-prop frameTrace=true
+travel r5f-p2-tr-ARD-4 ARD --bench-prop frameTrace=true
+travel r5f-p2-tr-WIN-4 WIN --bench-prop frameTrace=true

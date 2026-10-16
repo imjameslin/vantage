@@ -1,0 +1,592 @@
+--- a/net/minecraft/client/renderer/texture/TextureAtlas.java
++++ b/net/minecraft/client/renderer/texture/TextureAtlas.java
+@@ -7,12 +7,15 @@
+ import com.mojang.logging.LogUtils;
+ import com.mojang.renderpearl.api.GpuFormat;
+ import com.mojang.renderpearl.api.buffers.GpuBuffer;
++import com.mojang.renderpearl.api.commands.CommandEncoder;
+ import com.mojang.renderpearl.api.commands.RenderPass;
+ import com.mojang.renderpearl.api.device.GpuDevice;
+ import com.mojang.renderpearl.api.textures.FilterMode;
+ import com.mojang.renderpearl.api.textures.GpuSampler;
+ import com.mojang.renderpearl.api.textures.GpuTexture;
+ import com.mojang.renderpearl.api.textures.GpuTextureView;
++import com.mojang.renderpearl.backend.metal.MetalTickFx;
++import com.mojang.renderpearl.backend.metal.MetalLodMaterialInputs;
+ import java.io.IOException;
+ import java.io.Writer;
+ import java.nio.ByteBuffer;
+@@ -64,9 +67,14 @@
+         GpuDevice device = RenderSystem.getDevice();
+         this.releaseTextures();
+         this.texture = device.createTexture(this.location::toString, 15, GpuFormat.RGBA8_UNORM, newWidth, newHeight, 1, newMipLevel + 1);
++        // R7-2: on Metal both atlas copies are also kernel-writable (MetalTickFx.createWritable; measured free for sampling).
++        this.texture = MetalTickFx.createWritable(this.texture, this.location.toString());
+         this.textureView = device.createTextureView(this.texture);
+         this.width = newWidth;
+         this.height = newHeight;
++        if (LOCATION_BLOCKS.equals(this.location)) {
++            net.minecraft.client.renderer.chunk.TerrainGreedy.setAtlasSize(newWidth, newHeight);   // round 12 Part B prototype
++        }
+         this.maxMipLevel = newMipLevel;
+         this.mipLevelCount = newMipLevel + 1;
+         this.mipViews = new GpuTextureView[this.mipLevelCount];
+@@ -74,9 +82,15 @@
+         for (int level = 0; level <= this.maxMipLevel; level++) {
+             this.mipViews[level] = device.createTextureView(this.texture, level, 1);
+         }
++
++        this.spareValid = false;
+     }
+ 
++    /** Advances on every atlas (re)load or clear, never on animation ticks (Farsight far-image reuse key). */
++    public static volatile long contentGeneration;
++
+     public void upload(final SpriteLoader.Preparations preparations) {
++        contentGeneration++;
+         this.createTexture(preparations.width(), preparations.height(), preparations.mipLevel());
+         this.clearTextureData();
+         this.sampler = RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST);
+@@ -113,6 +127,7 @@
+ 
+             GpuBuffer spriteUbos = RenderSystem.getDevice().createBuffer(() -> this.location + " sprite UBOs", 128, spriteUboBuffer);
+             animationIndex = 0;
++            Builder<TextureAtlasSprite> animatedSpritesB = ImmutableList.builder();
+ 
+             for (TextureAtlasSprite sprite : this.sprites) {
+                 if (sprite.isAnimated()) {
+@@ -122,16 +137,23 @@
+                     animationIndex++;
+                     if (animationState != null) {
+                         animationStates.add(animationState);
++                        animatedSpritesB.add(sprite);
+                     }
+                 }
+             }
+ 
+             this.spriteUbos = spriteUbos;
+             this.animatedTexturesStates = animationStates.build();
++            this.animatedSprites = animatedSpritesB.build();
+             MemoryUtil.memFree(spriteUboBuffer);
+         }
+ 
++        var materialUpdate = MetalLodMaterialInputs.ENABLED
++            ? MetalLodMaterialInputs.beginAtlasUpload(this.texture, this.lodAnimatedRegions()) : null;
+         this.uploadInitialContents();
++        this.noteStreamWrite();
++        this.computeEligible = this.computeEligibility();
++        MetalLodMaterialInputs.finishAtlas(materialUpdate, this.texture, this.spareTexture, this.spareValid);
+         if (SharedConstants.DEBUG_DUMP_TEXTURE_ATLAS) {
+             Path dumpDir = TextureUtil.getDebugTexturePath();
+ 
+@@ -141,7 +163,21 @@
+             } catch (Exception e) {
+                 LOGGER.warn("Failed to dump atlas contents to {}", dumpDir);
+             }
++        }
++    }
++
++    /** All animated slots, even if creating an animation state failed. Mip coverage is expanded by the backend. */
++    private int @Nullable [][] lodAnimatedRegions() {
++        List<int[]> regions = new ArrayList<>();
++        for (TextureAtlasSprite sprite : this.sprites) {
++            if (!sprite.isAnimated()) continue;
++            int pad = padding(sprite);
++            long w = (long)sprite.contents().width() + 2L * pad;
++            long h = (long)sprite.contents().height() + 2L * pad;
++            if (pad < 0 || w <= 0 || h <= 0 || w > Integer.MAX_VALUE || h > Integer.MAX_VALUE) return null;
++            regions.add(new int[]{sprite.getX(), sprite.getY(), (int)w, (int)h});
+         }
++        return regions.toArray(int[][]::new);
+     }
+ 
+     private void uploadInitialContents() {
+@@ -240,10 +276,428 @@
+             }
+ 
+             this.uploadAnimationFrames();
++        }
++    }
++
++    // R5-D (CONTRACT.md 16.R5-D): -Dmc.fastTextureAnimation (default ON since round 5, 16.R5-FIN; =false is the off switch). Same passes (one per mip level: a Metal
++    // render encoder has one level per attachment and all attachments share one render area, so levels cannot share a
++    // pass), same draws with the same uniforms, but grouped by pipeline (INTERPOLATE sprites, then dirty BLIT sprites):
++    // two setPipeline per pass instead of one per draw (each re-sends every uniform the frontend holds; on Metal every
++    // switch also re-records all bindings). Exact: sprite slots (with padding) are disjoint, ColorTargetState.DEFAULT
++    // does not blend and there is no depth, so every texel is written by exactly one draw whatever the order. No
++    // per-tick allocation (no stream, no capturing label lambda per pass, sampler/pipelines looked up once per pass).
++    // Runtime-switchable since CONTRACT.md 16.AB (bench mode=abab sets it by reflection at a frame boundary): read once per
++    // atlas tick (render thread); both paths are stateless between ticks and draw the same texels.
++    public static volatile boolean FAST_TEXTURE_ANIMATION = !"false".equalsIgnoreCase(System.getProperty("mc.fastTextureAnimation", "true"))
++        && !"0".equals(System.getProperty("mc.fastTextureAnimation"));
++    private final java.util.function.Supplier<String> animateLabel = this::animateLabelText;
++
++    private String animateLabelText() {
++        return "Animate " + this.location;
++    }
++
++    private void uploadAnimationFramesFast() {
++        List<SpriteContents.AnimationState> states = this.animatedTexturesStates;
++        int count = states.size();
++        boolean anyInterpolated = false;
++        boolean anyBlit = false;
++        for (int i = 0; i < count; i++) {
++            SpriteContents.AnimationState state = states.get(i);
++            if (state.needsToDraw()) {
++                if (state.fastInterpolates()) {
++                    anyInterpolated = true;
++                } else {
++                    anyBlit = true;
++                }
++            }
++        }
++        if (!anyInterpolated && !anyBlit) {
++            return;
++        }
++        GpuDevice device = RenderSystem.getDevice();
++        GpuSampler sampler = RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST, true);
++        for (int level = 0; level <= this.maxMipLevel; level++) {
++            try (RenderPass renderPass = device.createCommandEncoder().createRenderPass(this.animateLabel, this.mipViews[level], Optional.empty())) {
++                RenderSystem.bindDefaultUniforms(renderPass);
++                if (anyInterpolated) {
++                    renderPass.setPipeline(RenderSystem.getCompiledPipeline(RenderPipelines.ANIMATE_SPRITE_INTERPOLATE));
++                    for (int i = 0; i < count; i++) {
++                        SpriteContents.AnimationState state = states.get(i);
++                        if (state.fastInterpolates()) {
++                            state.fastDrawToAtlas(renderPass, state.getDrawUbo(level), sampler);
++                        }
++                    }
++                }
++                if (anyBlit) {
++                    renderPass.setPipeline(RenderSystem.getCompiledPipeline(RenderPipelines.ANIMATE_SPRITE_BLIT));
++                    for (int i = 0; i < count; i++) {
++                        SpriteContents.AnimationState state = states.get(i);
++                        if (!state.fastInterpolates() && state.needsToDraw()) {
++                            state.fastDrawToAtlas(renderPass, state.getDrawUbo(level), sampler);
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    // R6-1 (docs/metal/CONTRACT.md 16.R6-1, results/ROUND6-PLAN.md item 1): hazard-free per-tick atlas updates.
++    // With TexturePingPong.enabled the atlas has two copies. A tick draws its changed sprites into the copy the frames in
++    // flight do not sample (the spare), then the two swap: `texture` / `textureView` / `mipViews` always name the copy
++    // frames sample. The spare lags the current copy by exactly the sprites in `spareLag` (drawn into the current copy
++    // since the spare was last brought up to date), so a ping-pong tick draws D(T) (the sprites needsToDraw() now) plus
++    // `spareLag` into the spare with each sprite's current state (an animation's texels depend only on its current state:
++    // AnimationState.fastDrawToAtlas), swaps, and sets spareLag = D(T). Grouped draw order as R5-D (exact: disjoint
++    // sprite slots, no blending). A tick with nothing to draw swaps nothing. In-place ticks (toggle off) add D(T) to
++    // spareLag, so the toggle switches at any tick. The spare is created (and filled by a full copy of every mip level)
++    // on the first ping-pong tick after createTexture (startup, resource reload), and released with the atlas.
++    /** Parallel to animatedTexturesStates: the sprite of each state (R7-2 needs its slot). */
++    private List<TextureAtlasSprite> animatedSprites = List.of();
++    private @Nullable GpuTexture spareTexture;
++    private @Nullable GpuTextureView spareTextureView;
++    private GpuTextureView[] spareMipViews = new GpuTextureView[0];
++    /** The spare exists and equals the current copy except for the sprites in spareLag. */
++    private boolean spareValid;
++    /** Per animatedTexturesStates index: drawn into the current copy since the spare was last brought up to date. */
++    private boolean[] spareLag = new boolean[0];
++    /** Per animatedTexturesStates index: drawn this tick (scratch). */
++    private boolean[] drawNow = new boolean[0];
++    private final java.util.function.Supplier<String> spareLabel = this::spareLabelText;
++
++    private String spareLabelText() {
++        return this.location + " (ping-pong)";
++    }
++
++    private void ensureLagArrays() {
++        int n = this.animatedTexturesStates.size();
++        if (this.spareLag.length != n) {
++            this.spareLag = new boolean[n];
++            this.drawNow = new boolean[n];
++            this.spareValid = false;
++        }
++    }
++
++    private void noteInPlaceDraws() {
++        if (!this.spareValid) {
++            return;
++        }
++        this.ensureLagArrays();
++        List<SpriteContents.AnimationState> states = this.animatedTexturesStates;
++        for (int i = 0, n = states.size(); i < n; i++) {
++            if (states.get(i).needsToDraw()) {
++                this.spareLag[i] = true;
++            }
++        }
++    }
++
++    private void releaseSpare() {
++        for (GpuTextureView view : this.spareMipViews) {
++            view.close();
++        }
++        this.spareMipViews = new GpuTextureView[0];
++        if (this.spareTextureView != null) {
++            this.spareTextureView.close();
++            this.spareTextureView = null;
++        }
++        if (this.spareTexture != null) {
++            this.spareTexture.close();
++            this.spareTexture = null;
++        }
++        this.spareValid = false;
++    }
++
++    private void uploadAnimationFramesPingPong() {
++        List<SpriteContents.AnimationState> states = this.animatedTexturesStates;
++        int count = states.size();
++        this.ensureLagArrays();
++        boolean[] lag = this.spareLag;
++        boolean[] now = this.drawNow;
++        boolean anyNow = false;
++        for (int i = 0; i < count; i++) {
++            now[i] = states.get(i).needsToDraw();
++            anyNow |= now[i];
++        }
++        if (!anyNow) {
++            return;   // nothing changed: the current copy stays, the spare keeps its lag
++        }
++        GpuDevice device = RenderSystem.getDevice();
++        if (!this.spareValid) {
++            if (this.spareTexture == null) {
++                this.spareTexture = device.createTexture(this.spareLabel, 15, GpuFormat.RGBA8_UNORM, this.width, this.height, 1, this.mipLevelCount);
++                this.spareTexture = MetalTickFx.createWritable(this.spareTexture, this.spareLabelText());
++                this.spareTextureView = device.createTextureView(this.spareTexture);
++                this.spareMipViews = new GpuTextureView[this.mipLevelCount];
++                for (int level = 0; level < this.mipLevelCount; level++) {
++                    this.spareMipViews[level] = device.createTextureView(this.spareTexture, level, 1);
++                }
++            }
++            GpuTexture current = this.getTexture();
++            CommandEncoder encoder = device.createCommandEncoder();
++            for (int level = 0; level < this.mipLevelCount; level++) {
++                encoder.copyTextureToTexture(
++                    current, this.spareTexture, level, 0, 0, 0, 0, Math.max(1, this.width >> level), Math.max(1, this.height >> level)
++                );
++            }
++            java.util.Arrays.fill(lag, false);
++            this.spareValid = true;
++            this.noteStreamWrite();
++        }
++        boolean anyInterpolated = false;
++        boolean anyBlit = false;
++        for (int i = 0; i < count; i++) {
++            if (now[i] || lag[i]) {
++                if (states.get(i).fastInterpolates()) {
++                    anyInterpolated = true;
++                } else {
++                    anyBlit = true;
++                }
++            }
++        }
++        GpuSampler sampler = RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST, true);
++        boolean computed = this.animateCompute(now, lag, count);
++        for (int level = 0; level <= this.maxMipLevel && !computed; level++) {
++            try (RenderPass renderPass = device.createCommandEncoder().createRenderPass(this.animateLabel, this.spareMipViews[level], Optional.empty())) {
++                RenderSystem.bindDefaultUniforms(renderPass);
++                if (anyInterpolated) {
++                    renderPass.setPipeline(RenderSystem.getCompiledPipeline(RenderPipelines.ANIMATE_SPRITE_INTERPOLATE));
++                    for (int i = 0; i < count; i++) {
++                        SpriteContents.AnimationState state = states.get(i);
++                        if ((now[i] || lag[i]) && state.fastInterpolates()) {
++                            state.fastDrawToAtlas(renderPass, state.getDrawUbo(level), sampler);
++                        }
++                    }
++                }
++                if (anyBlit) {
++                    renderPass.setPipeline(RenderSystem.getCompiledPipeline(RenderPipelines.ANIMATE_SPRITE_BLIT));
++                    for (int i = 0; i < count; i++) {
++                        SpriteContents.AnimationState state = states.get(i);
++                        if ((now[i] || lag[i]) && !state.fastInterpolates()) {
++                            state.fastDrawToAtlas(renderPass, state.getDrawUbo(level), sampler);
++                        }
++                    }
++                }
++            }
++        }
++        if (!computed) {
++            this.noteStreamWrite();
++        }
++        // Swap: frames from now on sample the copy just completed; the old one becomes the spare, behind by D(T).
++        GpuTexture t = this.texture;
++        GpuTextureView tv = this.textureView;
++        GpuTextureView[] mv = this.mipViews;
++        this.texture = this.spareTexture;
++        this.textureView = this.spareTextureView;
++        this.mipViews = this.spareMipViews;
++        this.spareTexture = t;
++        this.spareTextureView = tv;
++        this.spareMipViews = mv;
++        System.arraycopy(now, 0, lag, 0, count);
++    }
++
++    // R7-2 (docs/metal/CONTRACT.md 16.R7-2, results/ROUND7.md): on Metal, a ping-pong tick writes the changed sprites
++    // into the spare with a compute kernel on a side command buffer (MetalTickFx.atlasAnimate) instead of one render pass
++    // per mip level (each pass loaded and stored the whole level: +0.4-0.6 ms GPU on every tick frame). The kernel reads the
++    // texel the render pass's NEAREST sample hits, which is exact when sprite width, height and padding are multiples of
++    // 2^level for every level drawn (computeEligibility, per atlas; else the render passes). The side command buffer
++    // commits at once, so it runs only when no uncommitted stream record writes the atlas copies or the sprites' frame
++    // textures (streamWriteSeq: uploads, the spare's full copy, render-pass ticks). Toggle AtlasCompute.enabled.
++    /** Stream seq (MetalTickFx.recordingSeq) of the last stream record writing the copies or the frame textures. */
++    private long streamWriteSeq = Long.MAX_VALUE;
++    /** Every animated sprite can take the kernel (set at upload). */
++    private boolean computeEligible;
++    /** Every animation frame texture packed into one texture (R7-2 reads it; built at upload when eligible). */
++    private @Nullable GpuTexture computeFrames;
++    /** Origin (level 0) of each frame texture in computeFrames. */
++    private final java.util.IdentityHashMap<GpuTexture, int[]> computeFrameOrigin = new java.util.IdentityHashMap<>();
++    /** Per animated sprite: padding (from TextureAtlasSprite, read once). */
++    private int[] computePadding = new int[0];
++    /** Off-heap mcmtl_anim_op array (grown on demand, freed in clearTextureData). */
++    private long animOps;
++    private int animOpsCapacity;
++    private static final java.lang.reflect.@Nullable Field SPRITE_PADDING = spritePaddingField();
++
++    private static java.lang.reflect.@Nullable Field spritePaddingField() {
++        try {
++            java.lang.reflect.Field f = TextureAtlasSprite.class.getDeclaredField("padding");
++            f.setAccessible(true);
++            return f;
++        } catch (ReflectiveOperationException | RuntimeException e) {
++            LOGGER.warn("Atlas animation kernel unavailable: no TextureAtlasSprite.padding ({})", e.toString());
++            return null;
+         }
+     }
+ 
++    private static int padding(final TextureAtlasSprite sprite) {
++        try {
++            return SPRITE_PADDING == null ? -1 : SPRITE_PADDING.getInt(sprite);
++        } catch (IllegalAccessException e) {
++            return -1;
++        }
++    }
++
++    private void noteStreamWrite() {
++        this.streamWriteSeq = this.texture == null ? Long.MAX_VALUE : MetalTickFx.recordingSeq(this.texture);
++    }
++
++    private boolean computeEligibility() {
++        if (this.animatedTexturesStates.isEmpty() || this.texture == null || !MetalTickFx.isWritable(this.texture)
++            || !MetalTickFx.prepareAtlas(this.texture) || this.animatedSprites.size() != this.animatedTexturesStates.size()) {
++            return false;
++        }
++        for (int i = 0; i < this.animatedSprites.size(); i++) {
++            TextureAtlasSprite sprite = this.animatedSprites.get(i);
++            SpriteContents.AnimationState state = this.animatedTexturesStates.get(i);
++            int pad = padding(sprite);
++            int w = sprite.contents().width();
++            int h = sprite.contents().height();
++            int mask = (1 << this.maxMipLevel) - 1;
++            if (pad < 0 || (w & mask) != 0 || (h & mask) != 0 || (pad & mask) != 0 || state.computeFrameMipLevels() < this.mipLevelCount) {
++                LOGGER.info("{}: atlas animation kernel off ({} {}x{} padding {}, {} frame mips, atlas mips {})", this.location,
++                    sprite.contents().name(), w, h, pad, state.computeFrameMipLevels(), this.mipLevelCount);
++                return false;
++            }
++        }
++        return this.buildComputeFrames();
++    }
++
++    /**
++     * R7-2: packs every frame texture of the animated sprites into one texture (shelves, origins multiples of 2^maxMipLevel,
++     * so a frame's level L is the rectangle at origin >> L) by stream copies of every level; reads of it are the frame
++     * textures' texels. Also caches the sprites' paddings. False if it would exceed the maximum texture size.
++     */
++    private boolean buildComputeFrames() {
++        int n = this.animatedSprites.size();
++        this.computePadding = new int[n];
++        List<GpuTexture> frames = new ArrayList<>();
++        for (int i = 0; i < n; i++) {
++            this.computePadding[i] = padding(this.animatedSprites.get(i));
++            for (GpuTexture t : this.animatedTexturesStates.get(i).computeFrameTextures()) {
++                if (!this.computeFrameOrigin.containsKey(t)) {
++                    this.computeFrameOrigin.put(t, new int[2]);
++                    frames.add(t);
++                }
++            }
++        }
++        frames.sort((a, b) -> Integer.compare(b.getHeight(0), a.getHeight(0)));
++        int align = 1 << this.maxMipLevel;
++        int widthLimit = 1024;
++        for (GpuTexture t : frames) {
++            widthLimit = Math.max(widthLimit, roundUp(t.getWidth(0), align));
++        }
++        int x = 0;
++        int y = 0;
++        int shelf = 0;
++        for (GpuTexture t : frames) {
++            int w = roundUp(t.getWidth(0), align);
++            int h = roundUp(t.getHeight(0), align);
++            if (x + w > widthLimit) {
++                x = 0;
++                y += shelf;
++                shelf = 0;
++            }
++            int[] origin = this.computeFrameOrigin.get(t);
++            origin[0] = x;
++            origin[1] = y;
++            x += w;
++            shelf = Math.max(shelf, h);
++        }
++        int height = roundUp(Math.max(1, y + shelf), align);
++        if (height > this.maxSupportedTextureSize || frames.isEmpty()) {
++            this.computeFrameOrigin.clear();
++            return false;
++        }
++        GpuDevice device = RenderSystem.getDevice();
++        this.computeFrames = device.createTexture(this.location + " (animation frames)", 5, GpuFormat.RGBA8_UNORM, widthLimit, height, 1, this.mipLevelCount);
++        for (GpuTexture t : frames) {
++            int[] origin = this.computeFrameOrigin.get(t);
++            for (int level = 0; level <= this.maxMipLevel; level++) {
++                MetalTickFx.copyLevel(t, this.computeFrames, level, origin[0] >> level, origin[1] >> level, t.getWidth(0) >> level, t.getHeight(0) >> level);
++            }
++        }
++        this.noteStreamWrite();
++        return true;
++    }
++
++    private static int roundUp(final int v, final int align) {
++        return (v + align - 1) / align * align;
++    }
++
++    /** R7-2: the kernel path of a ping-pong tick; false = record the render passes instead (nothing was written). */
++    private boolean animateCompute(final boolean[] now, final boolean[] lag, final int count) {
++        if (!AtlasCompute.enabled || !this.computeEligible || this.computeFrames == null || this.spareTexture == null || !MetalTickFx.isWritable(this.spareTexture)
++            || MetalTickFx.recordingSeq(this.spareTexture) <= this.streamWriteSeq) {
++            return false;
++        }
++        int draws = 0;
++        for (int i = 0; i < count; i++) {
++            if (now[i] || lag[i]) {
++                draws++;
++            }
++        }
++        int ops = draws * this.mipLevelCount;
++        if (ops > this.animOpsCapacity) {
++            if (this.animOps != 0L) {
++                MemoryUtil.nmemFree(this.animOps);
++            }
++            this.animOpsCapacity = Math.max(ops, 64);
++            this.animOps = MemoryUtil.nmemCalloc(this.animOpsCapacity, MetalTickFx.ANIM_OP_SIZE);
++        }
++        long op = this.animOps;
++        for (int level = 0; level <= this.maxMipLevel; level++) {
++            for (int i = 0; i < count; i++) {
++                if (!now[i] && !lag[i]) {
++                    continue;
++                }
++                TextureAtlasSprite sprite = this.animatedSprites.get(i);
++                SpriteContents.AnimationState state = this.animatedTexturesStates.get(i);
++                int pad = this.computePadding[i];
++                int w = sprite.contents().width();
++                int h = sprite.contents().height();
++                boolean interp = state.fastInterpolates();
++                int[] cur = this.computeFrameOrigin.get(state.computeCurrentTexture());
++                int[] next = interp ? this.computeFrameOrigin.get(state.computeNextTexture()) : cur;
++                MemoryUtil.memPutInt(op, level);
++                MemoryUtil.memPutInt(op + 4, sprite.getX() >> level);
++                MemoryUtil.memPutInt(op + 8, sprite.getY() >> level);
++                MemoryUtil.memPutInt(op + 12, w + pad * 2 >> level);
++                MemoryUtil.memPutInt(op + 16, h + pad * 2 >> level);
++                MemoryUtil.memPutInt(op + 20, pad >> level);
++                MemoryUtil.memPutInt(op + 24, w >> level);
++                MemoryUtil.memPutInt(op + 28, h >> level);
++                MemoryUtil.memPutInt(op + 32, cur[0] >> level);
++                MemoryUtil.memPutInt(op + 36, cur[1] >> level);
++                MemoryUtil.memPutInt(op + 40, next[0] >> level);
++                MemoryUtil.memPutInt(op + 44, next[1] >> level);
++                MemoryUtil.memPutInt(op + 48, state.computeProgressAsInt());
++                MemoryUtil.memPutInt(op + 52, interp ? 1 : 0);
++                MemoryUtil.memPutLong(op + 56, 0L);
++                op += MetalTickFx.ANIM_OP_SIZE;
++            }
++        }
++        if (!MetalTickFx.atlasAnimate(this.spareTexture, this.computeFrames, this.animOps, ops)) {
++            return false;
++        }
++        AtlasCompute.ticks++;
++        return true;
++    }
++
+     private void uploadAnimationFrames() {
++        var materialUpdate = MetalLodMaterialInputs.beginAtlasAnimation(this.texture, this.spareTexture, this.spareValid);
++        this.uploadAnimationFramesAudited();
++        MetalLodMaterialInputs.finishAtlas(materialUpdate, this.texture, this.spareTexture, this.spareValid);
++    }
++
++    private void uploadAnimationFramesAudited() {
++        if (TexturePingPong.enabled) {
++            this.uploadAnimationFramesPingPong();
++            return;
++        }
++        this.noteInPlaceDraws();
++        this.noteStreamWrite();
++        if (FAST_TEXTURE_ANIMATION) {
++            this.uploadAnimationFramesFast();
++            return;
++        }
+         if (this.animatedTexturesStates.stream().anyMatch(SpriteContents.AnimationState::needsToDraw)) {
+             for (int level = 0; level <= this.maxMipLevel; level++) {
+                 try (RenderPass renderPass = RenderSystem.getDevice()
+@@ -275,11 +729,27 @@
+         }
+     }
+ 
++    /** Stage 4 (Tessera): the stitched sprites (a new list on every stitch), for the terrain material mask. */
++    public List<TextureAtlasSprite> tesseraSprites() {
++        return this.sprites;
++    }
++
++    public int tesseraWidth() {
++        return this.width;
++    }
++
++    public int tesseraHeight() {
++        return this.height;
++    }
++
+     public TextureAtlasSprite missingSprite() {
+         return Objects.requireNonNull(this.missingSprite, "Atlas not initialized");
+     }
+ 
+     public void clearTextureData() {
++        contentGeneration++;
++        MetalLodMaterialInputs.invalidate(this.texture);
++        MetalLodMaterialInputs.invalidate(this.spareTexture);
+         this.sprites.forEach(TextureAtlasSprite::close);
+         this.sprites = List.of();
+         this.animatedTexturesStates.forEach(SpriteContents.AnimationState::close);
+@@ -290,15 +760,31 @@
+             this.spriteUbos.close();
+             this.spriteUbos = null;
+         }
++        this.animatedSprites = List.of();
++        this.computeEligible = false;
++        this.computeFrameOrigin.clear();
++        if (this.computeFrames != null) {
++            this.computeFrames.close();
++            this.computeFrames = null;
++        }
++        if (this.animOps != 0L) {
++            MemoryUtil.nmemFree(this.animOps);
++            this.animOps = 0L;
++            this.animOpsCapacity = 0;
++        }
+     }
+ 
+     @Override
+     protected void releaseTextures() {
++        MetalLodMaterialInputs.invalidate(this.texture);
++        MetalLodMaterialInputs.invalidate(this.spareTexture);
+         super.releaseTextures();
+ 
+         for (GpuTextureView view : this.mipViews) {
+             view.close();
+         }
++
++        this.releaseSpare();
+     }
+ 
+     @Override

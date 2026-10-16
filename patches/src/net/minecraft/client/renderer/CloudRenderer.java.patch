@@ -1,0 +1,276 @@
+--- a/net/minecraft/client/renderer/CloudRenderer.java
++++ b/net/minecraft/client/renderer/CloudRenderer.java
+@@ -1,3 +1,12 @@
++// Patched copy of the vanilla 26.3 class (stage-2 terrain, docs/stage2/TERRAIN-PLAN.md S7). Differences from vanilla:
++//  - with TerrainToggles.cloudCull and a frame projection (setCullProjection), the full ring-ordered face list is built
++//    into a CPU array and only the faces whose cell can intersect a widened view cone (CloudFaceFilter) are uploaded,
++//    in the same order; the subset is re-uploaded (ring rotate) when the cone or the cloud offset drifts out of the
++//    margins, besides vanilla's own rebuild triggers. Otherwise the vanilla path, which also rebuilds once if the
++//    uploaded faces were a filtered subset (or, on the culled path, if the ring buffer was just recreated).
++//  - TerrainStats cloud counters.
++//  - stage 4 (Tessera, -Dmc.shaders=true): the non-OIT cloud passes bind the frame's light block (sun-lit clouds);
++//    the raymarched clouds can be marched at half resolution before the main pass (renderLow) and composited (cloudHalf).
+ package net.minecraft.client.renderer;
+ 
+ import com.mojang.blaze3d.buffers.Std140Builder;
+@@ -7,6 +16,11 @@
+ import com.mojang.logging.LogUtils;
+ import com.mojang.renderpearl.api.buffers.GpuBuffer;
+ import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
++import com.mojang.blaze3d.pipeline.RenderTarget;
++import com.mojang.blaze3d.pipeline.TextureTarget;
++import com.mojang.renderpearl.api.GpuFormat;
++import org.joml.Vector4f;
++import java.util.OptionalDouble;
+ import com.mojang.renderpearl.api.commands.RenderPass;
+ import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
+ import com.mojang.renderpearl.api.pipeline.RenderPipeline;
+@@ -18,6 +32,9 @@
+ import java.nio.ByteBuffer;
+ import java.util.Optional;
+ import net.minecraft.client.CloudStatus;
++import net.minecraft.client.renderer.chunk.TerrainFrustum;
++import net.minecraft.client.renderer.chunk.TerrainStats;
++import net.minecraft.client.renderer.chunk.TerrainToggles;
+ import net.minecraft.client.renderer.oit.OitRenderPassProvider;
+ import net.minecraft.client.renderer.oit.OitStage;
+ import net.minecraft.core.Direction;
+@@ -28,6 +45,7 @@
+ import net.minecraft.util.Mth;
+ import net.minecraft.util.profiling.ProfilerFiller;
+ import net.minecraft.world.phys.Vec3;
++import org.joml.Matrix4fc;
+ import org.jspecify.annotations.Nullable;
+ import org.slf4j.Logger;
+ 
+@@ -55,6 +73,13 @@
+     private int quadCount = 0;
+     private final MappableRingBuffer ubo = new MappableRingBuffer(() -> "Cloud UBO", 130, UBO_SIZE);
+     private @Nullable MappableRingBuffer utb;
++    // Stage-2 terrain patch (S7) state.
++    private @Nullable Matrix4fc cullProjection;
++    private final CloudFaceFilter faceFilter = new CloudFaceFilter();
++    private byte @Nullable [] allFaces;
++    private int allFaceCount;
++    private boolean allFacesBuilt;
++    private boolean uploadedFiltered;
+ 
+     protected Optional<CloudRenderer.TextureData> prepare(final ResourceManager manager, final ProfilerFiller profiler) {
+         try (
+@@ -97,6 +122,9 @@
+     protected void apply(final Optional<CloudRenderer.TextureData> preparations, final ResourceManager manager, final ProfilerFiller profiler) {
+         this.texture = preparations.orElse(null);
+         this.needsRebuild = true;
++        if (Tessera.ENABLED) {
++            Tessera.INSTANCE.cloudMap(this.texture);   // stage 4: the raymarched clouds' occupancy map
++        }
+     }
+ 
+     private static boolean isCellEmpty(final int color) {
+@@ -136,16 +164,18 @@
+             int radiusBlocks = range * 16;
+             int radiusCells = Mth.ceil(radiusBlocks / 12.0F);
+             int utbSize = getSizeForCloudDistance(radiusCells);
++            boolean utbRecreated = false;
+             if (this.utb == null || this.utb.currentBuffer().size() != utbSize) {
+                 if (this.utb != null) {
+                     this.utb.close();
+                 }
+ 
+                 this.utb = new MappableRingBuffer(() -> "Cloud UTB", 258, utbSize);
++                utbRecreated = true;
+             }
+ 
+             float relativeBottomY = (float)(bottomY - cameraPosition.y);
+-            float relativeTopY = relativeBottomY + 4.0F;
++            float relativeTopY = relativeBottomY + (Tessera.ENABLED ? 8.0F : 4.0F);   // stage 4: thicker clouds
+             CloudRenderer.RelativeCameraPos relativeCameraPos;
+             if (relativeTopY < 0.0F) {
+                 relativeCameraPos = CloudRenderer.RelativeCameraPos.ABOVE_CLOUDS;
+@@ -166,25 +196,77 @@
+             int cellZ = Mth.floor(cloudZ / 12.0);
+             float xInCell = (float)(cloudX - cellX * 12.0F);
+             float zInCell = (float)(cloudZ - cellZ * 12.0F);
++            if (Tessera.ENABLED && Tessera.volumetricClouds && Tessera.active) {
++                // stage 4: TesseraBloom raymarches the clouds; no boxes to build
++                Tessera.INSTANCE.cloudFrame(color, (float)cloudX, (float)cloudZ, relativeBottomY, radiusBlocks);
++                this.quadCount = 0;
++                this.needsRebuild = true;
++                return;
++            }
+             boolean fancyClouds = cloudStatus == CloudStatus.FANCY;
+-            if (this.needsRebuild
++            // Stage-2 terrain patch (S7): cull faces to a widened view cone when the frame projection is known.
++            Matrix4fc cullProjection = this.cullProjection;
++            this.cullProjection = null;
++            TerrainFrustum cullFrustum = TerrainToggles.cloudCull && cullProjection != null
++                ? TerrainFrustum.of(cullProjection, RenderSystem.getModelViewMatrixCopy())
++                : null;
++            boolean rebuild = this.needsRebuild
+                 || cellX != this.prevCellX
+                 || cellZ != this.prevCellZ
+                 || relativeCameraPos != this.prevRelativeCameraPos
+-                || cloudStatus != this.prevCloudStatus) {
++                || cloudStatus != this.prevCloudStatus;
++            if (cullFrustum != null ? utbRecreated || !this.allFacesBuilt : this.uploadedFiltered) {
++                // Culled path: a fresh ring buffer holds no faces yet, or the CPU face list was not built by this path.
++                // Vanilla path: the uploaded faces are a filtered subset.
++                rebuild = true;
++            }
++
++            if (rebuild) {
+                 this.needsRebuild = false;
+                 this.prevCellX = cellX;
+                 this.prevCellZ = cellZ;
+                 this.prevRelativeCameraPos = relativeCameraPos;
+                 this.prevCloudStatus = cloudStatus;
++                if (cullFrustum == null) {
++                    this.utb.rotate();
++
++                    try (GpuBufferSlice.MappedView view = this.utb.currentBuffer().map(false, true)) {
++                        this.buildMesh(relativeCameraPos, view.data(), cellX, cellZ, fancyClouds, radiusCells);
++                        this.quadCount = view.data().position() / 3;
++                    }
++
++                    this.uploadedFiltered = false;
++                    this.allFacesBuilt = false;
++                    this.allFaceCount = this.quadCount;
++                } else {
++                    if (this.allFaces == null || this.allFaces.length < utbSize) {
++                        this.allFaces = new byte[utbSize];
++                    }
++
++                    ByteBuffer faces = ByteBuffer.wrap(this.allFaces, 0, utbSize);
++                    this.buildMesh(relativeCameraPos, faces, cellX, cellZ, fancyClouds, radiusCells);
++                    this.allFaceCount = faces.position() / 3;
++                    this.allFacesBuilt = true;
++                    this.faceFilter.invalidate();
++                }
++            }
++
++            if (cullFrustum != null && (rebuild || !this.faceFilter.covers(cullFrustum, -xInCell, relativeBottomY, -zInCell))) {
++                this.faceFilter.reset(cullFrustum, -xInCell, relativeBottomY, -zInCell);
+                 this.utb.rotate();
+ 
+                 try (GpuBufferSlice.MappedView view = this.utb.currentBuffer().map(false, true)) {
+-                    this.buildMesh(relativeCameraPos, view.data(), cellX, cellZ, fancyClouds, radiusCells);
+-                    this.quadCount = view.data().position() / 3;
++                    this.quadCount = this.faceFilter.filter(this.allFaces, this.allFaceCount, view.data());
+                 }
++
++                this.uploadedFiltered = true;
+             }
+ 
++            if (TerrainStats.ENABLED) {
++                TerrainStats.add(TerrainStats.CLOUD_QUADS, this.quadCount);
++                TerrainStats.add(TerrainStats.CLOUD_QUADS_TOTAL, this.allFaceCount);
++            }
++
+             if (this.quadCount != 0) {
+                 RenderSystem.AutoStorageIndexBuffer indices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
+                 indices.requestIndexCount(6 * this.quadCount);
+@@ -193,17 +275,78 @@
+                     Std140Builder.intoBuffer(view.data())
+                         .putVec4(ARGB.vector4fFromARGB32(color))
+                         .putVec3(-xInCell, relativeBottomY, -zInCell)
+-                        .putVec3(12.0F, 4.0F, 12.0F);
++                        .putVec3(12.0F, Tessera.ENABLED ? 8.0F : 4.0F, 12.0F);
+                 }
+             }
+         }
+     }
+ 
++    /** Stage 4: the raymarched clouds at half resolution (1, -Dmc.shaders.cloudHalf=0: full resolution in the main pass). */
++    public static volatile int cloudHalf = Integer.getInteger("mc.shaders.cloudHalf", 1);
++    private @Nullable TextureTarget lowTarget;
++    private boolean lowReady;
++
++    /**
++     * Stage 4: marches the clouds into the half-size target (outside any render pass, before the main pass); render then
++     * composites it. Call after prepare and Tessera's frame light block.
++     */
++    public void renderLow(final RenderTarget main) {
++        this.lowReady = false;
++        if (!Tessera.ENABLED || cloudHalf == 0 || !Tessera.INSTANCE.cloudsOn()) {
++            return;
++        }
++        int w = Math.max(1, (main.width + 1) / 2), h = Math.max(1, (main.height + 1) / 2);
++        if (this.lowTarget == null || this.lowTarget.width != w || this.lowTarget.height != h) {
++            if (this.lowTarget != null) {
++                this.lowTarget.destroyBuffers();
++            }
++            this.lowTarget = new TextureTarget("Tessera clouds (half)", w, h, GpuFormat.RGBA8_UNORM, GpuFormat.D32_FLOAT);
++        }
++        try (RenderPass pass = RenderSystem.getDevice().createCommandEncoder().createRenderPass(() -> "Tessera clouds (half)",
++                this.lowTarget.getColorTextureView(), Optional.of(new Vector4f()), this.lowTarget.getDepthTextureView(), OptionalDouble.of(0.0))) {
++            pass.setPipeline(RenderSystem.getCompiledPipeline(RenderPipelines.TESSERA_CLOUDS_LOW));
++            RenderSystem.bindDefaultUniforms(pass);
++            Tessera.INSTANCE.bindTerrain(pass, true);
++            Tessera.INSTANCE.bindClouds(pass);
++            pass.draw(3, 1, 0, 0);
++        }
++        this.lowReady = true;
++    }
++
+     public void render(final CloudStatus cloudStatus, final RenderPass renderPass) {
++        if (this.lowReady && this.lowTarget != null && cloudHalf == 1) {
++            this.lowReady = false;
++            renderPass.pushDebugGroup(() -> "Tessera clouds (composite)");
++            renderPass.setPipeline(RenderSystem.getCompiledPipeline(RenderPipelines.TESSERA_CLOUDS_COMPOSITE));
++            // the same bindings the full-resolution draw leaves for the draws after it in this pass
++            RenderSystem.bindDefaultUniforms(renderPass);
++            Tessera.INSTANCE.bindTerrain(renderPass, true);
++            Tessera.INSTANCE.bindClouds(renderPass);
++            GpuSampler nearest = RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST);
++            renderPass.setUniform("InSampler", this.lowTarget.getColorTextureView(), RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR));
++            renderPass.setUniform("CloudDepth", this.lowTarget.getDepthTextureView(), nearest);
++            renderPass.draw(3, 1, 0, 0);
++            renderPass.popDebugGroup();
++            return;
++        }
++        if (Tessera.ENABLED && Tessera.INSTANCE.cloudsOn()) {
++            // stage 4: the raymarched clouds (core/tessera_clouds.fsh), one full-screen triangle
++            renderPass.pushDebugGroup(() -> "Tessera clouds");
++            renderPass.setPipeline(RenderSystem.getCompiledPipeline(RenderPipelines.TESSERA_CLOUDS));
++            RenderSystem.bindDefaultUniforms(renderPass);
++            Tessera.INSTANCE.bindTerrain(renderPass, true);
++            Tessera.INSTANCE.bindClouds(renderPass);
++            renderPass.draw(3, 1, 0, 0);
++            renderPass.popDebugGroup();
++            return;
++        }
+         if (this.texture != null && this.quadCount != 0) {
+             RenderPipeline renderPipeline = cloudStatus == CloudStatus.FANCY ? RenderPipelines.CLOUDS : RenderPipelines.FLAT_CLOUDS;
+             renderPass.pushDebugGroup(() -> "Clouds");
+             RenderSystem.bindDefaultUniforms(renderPass);
++            if (Tessera.ENABLED) {
++                Tessera.INSTANCE.bindTerrain(renderPass, true);   // stage 4: sun-lit clouds (core/clouds.fsh)
++            }
+             this.render(renderPass, renderPipeline);
+             renderPass.popDebugGroup();
+         }
+@@ -350,6 +493,14 @@
+         this.needsRebuild = true;
+     }
+ 
++    /**
++     * Stage-2 terrain patch (S7): the level projection of the current frame (null when unknown), used by the next
++     * {@link #prepare} call together with the model-view at that time (the one {@link #render} uses).
++     */
++    public void setCullProjection(final @Nullable Matrix4fc projection) {
++        this.cullProjection = projection;
++    }
++
+     public void endFrame() {
+         this.ubo.rotate();
+     }
+@@ -357,6 +508,9 @@
+     @Override
+     public void close() {
+         this.ubo.close();
++        if (this.lowTarget != null) {
++            this.lowTarget.destroyBuffers();
++        }
+         if (this.utb != null) {
+             this.utb.close();
+         }

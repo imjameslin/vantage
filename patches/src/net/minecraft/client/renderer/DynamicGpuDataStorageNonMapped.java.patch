@@ -1,0 +1,61 @@
+--- a/net/minecraft/client/renderer/DynamicGpuDataStorageNonMapped.java
++++ b/net/minecraft/client/renderer/DynamicGpuDataStorageNonMapped.java
+@@ -1,3 +1,6 @@
++// Patched copy of the vanilla 26.3 class (render-thread CPU work, docs/stage2/TERRAIN-PLAN.md S4). Difference from vanilla:
++// the added writeRawBatched (bulk variant of writeDataBatched, used by TerrainDrawList) and ensureCapacity (TASK E
++// pregrow, called only with -Dmc.terrain.pregrow); nothing else.
+ package net.minecraft.client.renderer;
+ 
+ import com.mojang.blaze3d.systems.RenderSystem;
+@@ -84,6 +87,16 @@
+         return result;
+     }
+ 
++    /**
++     * TASK E pregrow: grows to at least {@code count} blocks now (power of two), exactly as an in-frame resize would but
++     * without its log line; a no-op when the capacity already suffices. Render thread.
++     */
++    public void ensureCapacity(final int count) {
++        if (count > this.capacity) {
++            this.resizeBuffers(Mth.smallestEncompassingPowerOfTwo(count));
++        }
++    }
++
+     private void resizeBuffers(final int newCapacity) {
+         this.capacity = newCapacity;
+         this.nextBlock = 0;
+@@ -122,6 +135,34 @@
+         return result;
+     }
+ 
++    /**
++     * {@link #writeDataBatched} with the payload written by {@code writer} in one bulk write: {@code count} elements of
++     * exactly {@code blockSize} bytes each, into the same staging range, uploaded with the same writeToBuffer call.
++     */
++    public GpuBufferSlice writeRawBatched(final int count, final net.minecraft.client.renderer.DynamicGpuData.RawWriter writer) {
++        if (count == 0) {
++            return new GpuBufferSlice(null, 0L, 0L);
++        }
++
++        if (this.nextBlock + count > this.capacity) {
++            int newCapacity = Mth.smallestEncompassingPowerOfTwo(Math.max(this.capacity + 1, count));
++            LOGGER.info(
++                "Resizing {}, capacity limit of {} reached during a single frame. New capacity will be {}.",
++                new Object[]{this.label, this.capacity, newCapacity}
++            );
++            this.resizeBuffers(newCapacity);
++        }
++
++        int firstOffset = this.nextBlock * this.blockSize;
++        this.cpuBuffer.position(firstOffset);
++        writer.write(this.cpuBuffer);
++        ByteBuffer cpuSlice = this.cpuBuffer.slice(firstOffset, count * this.blockSize);
++        GpuBufferSlice result = this.gpuBuffer.slice(firstOffset, count * this.blockSize);
++        RenderSystem.getDevice().createCommandEncoder().writeToBuffer(result, cpuSlice);
++        this.nextBlock = this.nextBlock + count;
++        return result;
++    }
++
+     @Override
+     public GpuBufferSlice[] writeDataBatchedMultiple(final List<List<T>> dataLists) {
+         if (dataLists.isEmpty()) {

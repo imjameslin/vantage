@@ -1,0 +1,149 @@
+diff --git a/client/src/net/minecraft/client/renderer/LevelRenderer.java b/client/src/net/minecraft/client/renderer/LevelRenderer.java
+index fb08e24..9ce72f5 100644
+--- a/client/src/net/minecraft/client/renderer/LevelRenderer.java
++++ b/client/src/net/minecraft/client/renderer/LevelRenderer.java
+@@ -1373,7 +1373,9 @@ public class LevelRenderer implements AutoCloseable {
+                 this.frameSortSolidSections,
+                 this.frameSortCutoutSections
+             );
+-            return list.build(this.visibleSections, this.sectionRenderDispatcher);
++            int largest = list.build(this.visibleSections, this.sectionRenderDispatcher);
++            net.minecraft.client.renderer.chunk.Lod.captureNearTerrain(this.viewArea, this.visibleSections, now, fadeDuration);
++            return largest;
+         } finally {
+             this.sectionRenderDispatcher.unlock();
+         }
+diff --git a/client/src/net/minecraft/client/renderer/chunk/Lod.java b/client/src/net/minecraft/client/renderer/chunk/Lod.java
+index 0d890dc..bffbd15 100644
+--- a/client/src/net/minecraft/client/renderer/chunk/Lod.java
++++ b/client/src/net/minecraft/client/renderer/chunk/Lod.java
+@@ -42,6 +42,8 @@ public final class Lod {
+     public static final boolean BUILD = flag("mc.lod", false);
+     public static final int RADIUS = Math.max(4, Integer.getInteger("mc.lod.radius", 64));
+     public static volatile boolean draw = flag("mc.lod.draw", true);
++    /** Opt-in until flight/quality qualification: keep old terrain until its replacement can draw. */
++    public static volatile boolean handoff = flag("mc.lod.handoff", false);
+     /**
+      * Diagnostics (abab-switchable, read per draw): LOD layers drawn, bit 0 SOLID, 1 CUTOUT, 2 TRANSLUCENT (default 7). 0 keeps
+      * the cull dispatch, the far plane and the fog of {@link #draw} without rasterizing any LOD quad (cost attribution).
+@@ -269,6 +271,27 @@ public final class Lod {
+ 
+     private static long frameCounter;
+     private static int lastChunkEvents = -1;
++    private static long lastNearRevision = -1L;
++    private static boolean lastHandoff;
++
++    /** Called under the terrain dispatcher's copy lock, with the same visible list used for this frame. */
++    public static void captureNearTerrain(final net.minecraft.client.renderer.ViewArea view,
++        final java.util.List<SectionRenderDispatcher.RenderSection> sections, final long now, final long fadeDuration) {
++        LodManager m = manager;
++        if (!BUILD || !handoff || !draw || m == null) return;
++        m.handoff.begin(view);
++        for (SectionRenderDispatcher.RenderSection s : sections) {
++            SectionMesh mesh = s.getSectionMesh();
++            m.handoff.observe(s, s.getSectionNode(), mesh, mesh != CompiledSectionMesh.UNCOMPILED,
++                s.getVisibility(now, fadeDuration));
++        }
++    }
++
++    /** Mesh publication/reset is distinct from a client chunk-load event. */
++    public static void nearSectionChanged() {
++        LodManager m = manager;
++        if (BUILD && handoff && m != null) m.handoff.invalidate();
++    }
+ 
+     /**
+      * Render thread, from {@code LevelRenderer.prepareChunkRendersIndirectFast} after the terrain cluster dispatch: captures
+@@ -325,8 +348,12 @@ public final class Lod {
+             return;
+         }
+         m.gpu.uploadPending(48L << 20, camX, camY, camZ);
+-        boolean chunksChanged = m.chunkEvents != lastChunkEvents;
++        long nearRevision = m.handoff.revision();
++        boolean chunksChanged = m.chunkEvents != lastChunkEvents || handoff != lastHandoff
++            || handoff && nearRevision != lastNearRevision;
+         lastChunkEvents = m.chunkEvents;
++        lastNearRevision = nearRevision;
++        lastHandoff = handoff;
+         if (m.wave != null) {
+             // Round 5 (LodWave): the wave far field, plus the raster meshes of the near level-0 ring (LodWave.RING_PX).
+             java.util.List<TerrainClusters.Draw> ring = LodWave.RING_PX > 0.0 ? m.gpu.frame(m.level(), planes, frustum, camX, camY, camZ, eyeX, eyeY, eyeZ, chunksChanged) : null;
+diff --git a/client/src/net/minecraft/client/renderer/chunk/LodManager.java b/client/src/net/minecraft/client/renderer/chunk/LodManager.java
+index df051ba..7cf8ba5 100644
+--- a/client/src/net/minecraft/client/renderer/chunk/LodManager.java
++++ b/client/src/net/minecraft/client/renderer/chunk/LodManager.java
+@@ -329,6 +329,7 @@ final class LodManager {
+ 
+     /** Render thread: bumped on every chunk load / unload (the drawn set re-checks which level-0 nodes vanilla covers). */
+     int chunkEvents;
++    final LodHandoff handoff = new LodHandoff();
+ 
+     void onChunkLoaded(final ChunkPos pos) {
+         this.chunkEvents++;
+diff --git a/client/src/net/minecraft/client/renderer/chunk/SectionRenderDispatcher.java b/client/src/net/minecraft/client/renderer/chunk/SectionRenderDispatcher.java
+index b985b63..7f966c1 100644
+--- a/client/src/net/minecraft/client/renderer/chunk/SectionRenderDispatcher.java
++++ b/client/src/net/minecraft/client/renderer/chunk/SectionRenderDispatcher.java
+@@ -417,6 +417,7 @@ public class SectionRenderDispatcher {
+             this.cancelTasks();
+             this.statsSources = 0;
+             SectionMesh mesh = this.sectionMesh.getAndSet(CompiledSectionMesh.UNCOMPILED);
++            Lod.nearSectionChanged();
+             SectionRenderDispatcher.this.copyLock.lock();
+ 
+             try {
+@@ -493,6 +494,7 @@ public class SectionRenderDispatcher {
+ 
+         private SectionMesh setSectionMesh(final SectionMesh sectionMesh) {
+             SectionMesh oldMesh = this.sectionMesh.getAndSet(sectionMesh);
++            Lod.nearSectionChanged();
+             SectionRenderDispatcher.this.onSectionMeshUpdate.accept(this);
+             this.updateUploadTime();
+             return oldMesh;
+diff --git a/client/src/net/minecraft/client/renderer/chunk/LodHandoff.java b/client/src/net/minecraft/client/renderer/chunk/LodHandoff.java
+new file mode 100644
+--- /dev/null
++++ b/client/src/net/minecraft/client/renderer/chunk/LodHandoff.java
+@@ -0,0 +1,42 @@
++package net.minecraft.client.renderer.chunk;
++
++import java.util.IdentityHashMap;
++import java.util.concurrent.atomic.AtomicLong;
++
++/** Native section coverage, keyed by rotating slot AND its current coordinate/mesh incarnation.
++ * Chunk data arriving is deliberately not evidence of coverage. A mesh is admitted only after
++ * the terrain draw-list builder has seen it fully faded in. Off-screen slots remain admitted
++ * until their mesh or coordinate changes, avoiding LOD item rebuilds on every camera turn. */
++final class LodHandoff {
++    private record Ready(long coordinate, Object mesh) {}
++    private final IdentityHashMap<Object, Ready> ready = new IdentityHashMap<>();
++    private final AtomicLong invalidations = new AtomicLong();
++    private Object view;
++    private long revision;
++
++    void begin(Object view) {
++        if (view != this.view) {
++            this.view = view;
++            this.ready.clear();
++            this.revision++;
++        }
++    }
++
++    void observe(Object slot, long coordinate, Object mesh, boolean compiled, float visibility) {
++        if (!compiled || !(visibility >= 1.0F)) return;
++        Ready old = this.ready.get(slot);
++        if (old == null || old.coordinate != coordinate || old.mesh != mesh) {
++            this.ready.put(slot, new Ready(coordinate, mesh));
++            this.revision++;
++        }
++    }
++
++    boolean covers(Object slot, long coordinate, Object mesh) {
++        Ready old = this.ready.get(slot);
++        return old != null && old.coordinate == coordinate && old.mesh == mesh;
++    }
++
++    /** EMPTY results can publish on workers; all map operations remain on the render thread. */
++    void invalidate() { this.invalidations.incrementAndGet(); }
++    long revision() { return this.revision + this.invalidations.get(); }
++}

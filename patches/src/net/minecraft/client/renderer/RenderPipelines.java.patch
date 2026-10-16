@@ -1,0 +1,798 @@
+--- a/net/minecraft/client/renderer/RenderPipelines.java
++++ b/net/minecraft/client/renderer/RenderPipelines.java
+@@ -1,3 +1,8 @@
++// Patched copy of the vanilla 26.3 class (stage-2 terrain S5, docs/stage2/TERRAIN-PLAN.md 4.5). Differences from vanilla:
++//  - *_TERRAIN_COMPACT(_MULTIDRAW) and WIREFRAME_COMPACT(_MULTIDRAW): the SOLID/CUTOUT terrain pipelines (and the debug
++//    wireframe) with the 16-byte vertex (chunk/TerrainCompact.FORMAT) and the TERRAIN_COMPACT shader define. They are
++//    defined after every vanilla pipeline, so the vanilla pipelines keep their sort keys (GUI batching order).
++//  - compactTerrainVariant(): the compact variant of a SOLID/CUTOUT/wireframe terrain pipeline.
+ package net.minecraft.client.renderer;
+ 
+ import com.mojang.blaze3d.vertex.DefaultVertexFormat;
+@@ -14,6 +19,8 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
++import org.jspecify.annotations.Nullable;
++import net.minecraft.client.renderer.chunk.TerrainCompact;
+ import net.minecraft.client.renderer.oit.OitPipelineSet;
+ import net.minecraft.resources.Identifier;
+ 
+@@ -73,21 +80,47 @@
+     private static final RenderPipeline.Snippet LIT_BLOCKS_SNIPPET = RenderPipeline.builder(GENERIC_BLOCKS_SNIPPET)
+         .withBindGroupLayout(BindGroupLayouts.SAMPLER2)
+         .buildSnippet();
+-    private static final RenderPipeline.Snippet TERRAIN_SNIPPET = RenderPipeline.builder(LIT_BLOCKS_SNIPPET)
++    private static final RenderPipeline.Snippet TERRAIN_SNIPPET = tesseraDefine(RenderPipeline.builder(LIT_BLOCKS_SNIPPET)
+         .withBindGroupLayout(BindGroupLayouts.PROJECTION)
+         .withBindGroupLayout(BindGroupLayouts.CHUNK_SECTION)
+         .withBindGroupLayout(BindGroupLayouts.TERRAIN_INFO)
+         .withVertexShader("core/terrain")
+         .withFragmentShader("core/terrain")
+-        .buildSnippet();
+-    private static final RenderPipeline.Snippet MULTIDRAW_TERRAIN_SNIPPET = RenderPipeline.builder(LIT_BLOCKS_SNIPPET)
++        ).buildSnippet();
++    private static final RenderPipeline.Snippet MULTIDRAW_TERRAIN_SNIPPET = tesseraDefine(RenderPipeline.builder(LIT_BLOCKS_SNIPPET)
+         .withBindGroupLayout(BindGroupLayouts.PROJECTION)
+         .withBindGroupLayout(BindGroupLayouts.TERRAIN_INFO)
+         .withVertexBinding(1, DefaultVertexFormat.CHUNK_DATA_INSTANCED)
+         .withVertexShader("core/terrain")
+         .withFragmentShader("core/terrain")
+         .withShaderDefine("MULTIDRAW_TERRAIN")
+-        .buildSnippet();
++        ).buildSnippet();
++
++    /** Stage 4 (Tessera): every terrain pipeline gets the TESSERA define when shaders are on (-Dmc.shaders=true). */
++    private static RenderPipeline.Builder tesseraDefine(final RenderPipeline.Builder builder) {
++        if (Tessera.ENABLED && !"false".equals(System.getProperty("mc.shaders.sway"))) {
++            builder.withShaderDefine("TESSERA_SWAY");   // -Dmc.shaders.sway=false: no waving (probe)
++        }
++        return !Tessera.ENABLED ? builder : builder.withShaderDefine("TESSERA")
++            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++                .withUniform("TesseraShadow", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("TesseraLight", com.mojang.renderpearl.api.pipeline.UniformType.UNIFORM_BUFFER)
++                .withUniform("TesseraMaterial", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("TesseraFar", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("TesseraFarFine", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("TesseraShafts", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build());
++    }
++    /** Stage 4 (Tessera): rain drawn as pale grey streaks (core/particle, TESSERA_WEATHER); snow unchanged. */
++    private static RenderPipeline.Builder tesseraWeather(final RenderPipeline.Builder builder) {
++        return !Tessera.ENABLED ? builder : builder.withShaderDefine("TESSERA_WEATHER");
++    }
++    /** Stage 4 (Tessera): the translucent terrain pipelines also shade water (TESSERA_WATER). */
++    private static RenderPipeline.Builder tesseraWater(final RenderPipeline.Builder builder) {
++        return !Tessera.ENABLED ? builder : builder.withShaderDefine("TESSERA_WATER")
++            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++                .withUniform("TesseraReflect", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("TesseraCloudMap", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build());
++    }
+     private static final RenderPipeline.Snippet BLOCK_SNIPPET = RenderPipeline.builder(LIT_BLOCKS_SNIPPET)
+         .withBindGroupLayout(BindGroupLayouts.PROJECTION)
+         .withBindGroupLayout(BindGroupLayouts.DYNAMIC_TRANSFORMS)
+@@ -125,9 +158,10 @@
+         .withPrimitiveTopology(PrimitiveTopology.QUADS)
+         .withDepthStencilState(DepthStencilState.DEFAULT)
+         .buildSnippet();
+-    private static final RenderPipeline.Snippet ENTITY_SNIPPET = RenderPipeline.builder(ENTITY_NO_LIGHTMAP_SNIPPET)
++    // Stage 4 (Tessera): lightmapped entities can be lit by Tessera's model (core/entity, TESSERA)
++    private static final RenderPipeline.Snippet ENTITY_SNIPPET = tesseraDefine(RenderPipeline.builder(ENTITY_NO_LIGHTMAP_SNIPPET)
+         .withBindGroupLayout(BindGroupLayouts.LIGHTING)
+-        .withBindGroupLayout(BindGroupLayouts.SAMPLER2)
++        .withBindGroupLayout(BindGroupLayouts.SAMPLER2))
+         .buildSnippet();
+     private static final RenderPipeline.Snippet OIT_ENTITY_SNIPPET = RenderPipeline.builder()
+         .withBindGroupLayout(BindGroupLayouts.DYNAMIC_TRANSFORMS)
+@@ -163,13 +197,14 @@
+         .withPrimitiveTopology(PrimitiveTopology.QUADS)
+         .withDepthStencilState(DepthStencilState.DEFAULT)
+         .buildSnippet();
+-    private static final RenderPipeline.Snippet ITEM_SNIPPET = RenderPipeline.builder(MATRICES_FOG_LIGHT_DIR_SNIPPET)
++    // Stage 4 (Tessera): items in the level (held, dropped, framed) can be lit by Tessera's model (core/item, TESSERA)
++    private static final RenderPipeline.Snippet ITEM_SNIPPET = tesseraDefine(RenderPipeline.builder(MATRICES_FOG_LIGHT_DIR_SNIPPET)
+         .withVertexShader("core/item")
+         .withFragmentShader("core/item")
+         .withBindGroupLayout(BindGroupLayouts.SAMPLER0_SAMPLER1_SAMPLER2)
+         .withVertexBinding(0, DefaultVertexFormat.ENTITY)
+         .withPrimitiveTopology(PrimitiveTopology.QUADS)
+-        .withDepthStencilState(DepthStencilState.DEFAULT)
++        .withDepthStencilState(DepthStencilState.DEFAULT))
+         .buildSnippet();
+     private static final RenderPipeline.Snippet OIT_ITEM_SNIPPET = RenderPipeline.builder()
+         .withBindGroupLayout(BindGroupLayouts.DYNAMIC_TRANSFORMS)
+@@ -388,14 +423,14 @@
+             .build()
+     );
+     public static final RenderPipeline TRANSLUCENT_TERRAIN = register(
+-        RenderPipeline.builder(TERRAIN_SNIPPET)
++        tesseraWater(RenderPipeline.builder(TERRAIN_SNIPPET))
+             .withLocation("pipeline/translucent_terrain")
+             .withColorTargetState(new ColorTargetState(BlendFunction.TRANSLUCENT))
+             .withShaderDefine("ALPHA_CUTOUT", 0.1F)
+             .build()
+     );
+     public static final RenderPipeline TRANSLUCENT_TERRAIN_MULTIDRAW = register(
+-        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++        tesseraWater(RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET))
+             .withLocation("pipeline/translucent_terrain_multidraw")
+             .withColorTargetState(new ColorTargetState(BlendFunction.TRANSLUCENT))
+             .withShaderDefine("ALPHA_CUTOUT", 0.1F)
+@@ -898,9 +933,9 @@
+         RenderPipeline.builder(END_PORTAL_SNIPPET).withLocation("pipeline/end_gateway").withShaderDefine("PORTAL_LAYERS", 16).build()
+     );
+     public static final RenderPipeline FLAT_CLOUDS = register(
+-        RenderPipeline.builder(CLOUDS_SNIPPET).withLocation("pipeline/flat_clouds").withCull(false).build()
++        tesseraDefine(RenderPipeline.builder(CLOUDS_SNIPPET)).withLocation("pipeline/flat_clouds").withCull(false).build()
+     );
+-    public static final RenderPipeline CLOUDS = register(RenderPipeline.builder(CLOUDS_SNIPPET).withLocation("pipeline/clouds").build());
++    public static final RenderPipeline CLOUDS = register(tesseraDefine(RenderPipeline.builder(CLOUDS_SNIPPET)).withLocation("pipeline/clouds").build());
+     public static final OitPipelineSet OIT_CLOUDS = register(
+         OitPipelineSet.builder("clouds", RenderPipeline.builder(OIT_CLOUDS_SNIPPET))
+             .withDepthBoundsModifier(depthBounds -> depthBounds.withDepthStencilState(DepthStencilState.DEFAULT))
+@@ -1013,17 +1048,17 @@
+             .build()
+     );
+     public static final RenderPipeline OPAQUE_PARTICLE = register(
+-        RenderPipeline.builder(PARTICLE_SNIPPET).withLocation("pipeline/opaque_particle").withColorTargetState(ColorTargetState.DEFAULT).build()
++        tesseraDefine(RenderPipeline.builder(PARTICLE_SNIPPET)).withLocation("pipeline/opaque_particle").withColorTargetState(ColorTargetState.DEFAULT).build()
+     );
+     public static final RenderPipeline TRANSLUCENT_PARTICLE = register(
+-        RenderPipeline.builder(PARTICLE_SNIPPET)
++        tesseraDefine(RenderPipeline.builder(PARTICLE_SNIPPET))
+             .withLocation("pipeline/translucent_particle")
+             .withColorTargetState(new ColorTargetState(BlendFunction.TRANSLUCENT))
+             .build()
+     );
+     public static final OitPipelineSet OIT_PARTICLE = register(OitPipelineSet.builder("particle", RenderPipeline.builder(OIT_PARTICLE_SNIPPET)).build());
+     public static final RenderPipeline WEATHER = register(
+-        RenderPipeline.builder(WEATHER_SNIPPET)
++        tesseraWeather(RenderPipeline.builder(WEATHER_SNIPPET))
+             .withLocation("pipeline/weather")
+             .withDepthStencilState(new DepthStencilState(CompareOp.GREATER_THAN_OR_EQUAL, false))
+             .build()
+@@ -1032,7 +1067,7 @@
+         OitPipelineSet.builder("weather", RenderPipeline.builder(OIT_PARTICLE_SNIPPET).withCull(false)).build()
+     );
+     public static final RenderPipeline SKY = register(
+-        RenderPipeline.builder(MATRICES_FOG_SNIPPET)
++        tesseraDefine(RenderPipeline.builder(MATRICES_FOG_SNIPPET))
+             .withLocation("pipeline/sky")
+             .withVertexShader("core/sky")
+             .withFragmentShader("core/sky")
+@@ -1274,9 +1309,636 @@
+             .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
+             .withBindGroupLayout(BindGroupLayouts.IN_SAMPLER)
+             .withDepthStencilState(new DepthStencilState(CompareOp.ALWAYS_PASS, true))
++            .build()
++    );
++
++    // Stage 4 (Tessera bloom, TesseraBloom): full-screen steps of the bloom mip chain.
++    private static RenderPipeline tesseraBloom(final String location, final String fragment, final @Nullable String define, final boolean additive) {
++        RenderPipeline.Builder builder = RenderPipeline.builder()
++            .withLocation(location)
++            .withVertexShader("core/screenquad")
++            .withFragmentShader(fragment)
++            .withBindGroupLayout(BindGroupLayouts.IN_SAMPLER)
++            .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++            .withCull(false)
++            // the chain is linear light in half floats; the composite mixes it over the frame and multiplies the vignette (premultiplied)
++            .withColorTargetState(define != null && define.equals("TESSERA_COMPOSITE")
++                ? new ColorTargetState(Optional.of(new BlendFunction(com.mojang.renderpearl.api.pipeline.BlendFactor.ONE,
++                    com.mojang.renderpearl.api.pipeline.BlendFactor.ONE_MINUS_SRC_ALPHA)), GpuFormat.RGBA8_UNORM, 7)
++                : new ColorTargetState(additive ? Optional.of(BlendFunction.ADDITIVE) : Optional.empty(), GpuFormat.RGBA16_FLOAT, additive ? 7 : 15));
++        if (define != null) {
++            builder.withShaderDefine(define);
++        }
++        return register(builder.build());
++    }
++    // Stage 4 (Tessera ambient occlusion): half-resolution AO from the main depth, then multiplied onto the frame.
++    public static final RenderPipeline TESSERA_AO = register(tesseraDefine(RenderPipeline.builder(MATRICES_FOG_SNIPPET)
++            .withLocation("pipeline/tessera_ao")
++            .withVertexShader("core/screenquad")
++            .withFragmentShader("core/tessera_ao")
++            .withBindGroupLayout(BindGroupLayouts.IN_SAMPLER))
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(ColorTargetState.DEFAULT)
++        .build());
++    // the AO from the reflection source's half-resolution distances (a) instead of the full-resolution depth
++    public static final RenderPipeline TESSERA_AO_DIST = register(tesseraDefine(RenderPipeline.builder(MATRICES_FOG_SNIPPET)
++            .withLocation("pipeline/tessera_ao_dist")
++            .withVertexShader("core/screenquad")
++            .withFragmentShader("core/tessera_ao")
++            .withShaderDefine("TESSERA_AO_DIST")
++            .withBindGroupLayout(BindGroupLayouts.IN_SAMPLER))
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(ColorTargetState.DEFAULT)
++        .build());
++    // Stage 4 (Tessera water reflections): the half-resolution world image (rgb) and distance (a) for the next frame.
++    public static final RenderPipeline TESSERA_REFLECT_SOURCE = register(tesseraDefine(RenderPipeline.builder(MATRICES_FOG_SNIPPET)
++            .withLocation("pipeline/tessera_reflect_source")
++            .withVertexShader("core/screenquad")
++            .withFragmentShader("core/tessera_reflect_source")
++            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++                .withUniform("InSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("DepthSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build()))
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(new ColorTargetState(Optional.empty(), GpuFormat.RGBA16_FLOAT, 15))
++        .build());
++    // Stage 4 (Tessera god rays): how much of the light shafts' air the shadow map shadows along each half-resolution pixel's
++    // ray (r; 0 = all lit), from the reflection source's distances; the next frame's terrain and sky read it (TesseraShafts)
++    public static final RenderPipeline TESSERA_SHAFTS = register(tesseraDefine(RenderPipeline.builder(MATRICES_FOG_SNIPPET)
++            .withLocation("pipeline/tessera_shafts")
++            .withVertexShader("core/screenquad")
++            .withFragmentShader("core/tessera_shafts")
++            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++                .withUniform("DistSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build()))
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(new ColorTargetState(Optional.empty(), GpuFormat.RGBA8_UNORM, 15))
++        .build());
++    // the reflection source with the AO as a second target (one half-resolution pass for both)
++    public static final RenderPipeline TESSERA_REFLECT_SOURCE_AO = register(tesseraDefine(RenderPipeline.builder(MATRICES_FOG_SNIPPET)
++            .withLocation("pipeline/tessera_reflect_source_ao")
++            .withVertexShader("core/screenquad")
++            .withFragmentShader("core/tessera_reflect_source")
++            .withShaderDefine("TESSERA_REFLECT_AO")
++            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++                .withUniform("InSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("DepthSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build()))
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(0, new ColorTargetState(Optional.empty(), GpuFormat.RGBA16_FLOAT, 15))
++        .withColorTargetState(1, new ColorTargetState(Optional.empty(), GpuFormat.RGBA8_UNORM, 15))
++        .build());
++    // Stage 4 (Tessera clouds): raymarched volumetric clouds over vanilla's cloud map, one full-screen triangle drawn where
++    // vanilla draws its clouds; blended premultiplied, depth tested and written at the cloud surface (gl_FragDepth).
++    public static final RenderPipeline TESSERA_CLOUDS = register(tesseraDefine(RenderPipeline.builder(MATRICES_FOG_SNIPPET)
++            .withLocation("pipeline/tessera_clouds")
++            .withVertexShader("core/screenquad")
++            .withFragmentShader("core/tessera_clouds")
++            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++                .withUniform("TesseraCloudMap", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build()))
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withDepthStencilState(DepthStencilState.DEFAULT)
++        .withColorTargetState(new ColorTargetState(Optional.of(new BlendFunction(
++            com.mojang.renderpearl.api.pipeline.BlendFactor.ONE, com.mojang.renderpearl.api.pipeline.BlendFactor.ONE_MINUS_SRC_ALPHA)), GpuFormat.RGBA8_UNORM, 7))
++        .build());
++    // Stage 4 (Tessera clouds, half resolution, Tessera.cloudHalf): the same march into a half-size target (no blend,
++    // depth written at the cloud surface, test always), then composited over the frame where the clouds are drawn
++    public static final RenderPipeline TESSERA_CLOUDS_LOW = register(tesseraDefine(RenderPipeline.builder(MATRICES_FOG_SNIPPET)
++            .withLocation("pipeline/tessera_clouds_low")
++            .withVertexShader("core/screenquad")
++            .withFragmentShader("core/tessera_clouds")
++            .withShaderDefine("TESSERA_CLOUDS_LOW")
++            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++                .withUniform("TesseraCloudMap", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build()))
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withDepthStencilState(new DepthStencilState(CompareOp.ALWAYS_PASS, true))
++        .withColorTargetState(new ColorTargetState(Optional.empty(), GpuFormat.RGBA8_UNORM, 15))
++        .build());
++    public static final RenderPipeline TESSERA_CLOUDS_COMPOSITE = register(RenderPipeline.builder()
++        .withLocation("pipeline/tessera_clouds_composite")
++        .withVertexShader("core/screenquad")
++        .withFragmentShader("core/tessera_clouds_composite")
++        .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++            .withUniform("InSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++            .withUniform("CloudDepth", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build())
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withDepthStencilState(DepthStencilState.DEFAULT)
++        .withColorTargetState(new ColorTargetState(Optional.of(new BlendFunction(
++            com.mojang.renderpearl.api.pipeline.BlendFactor.ONE, com.mojang.renderpearl.api.pipeline.BlendFactor.ONE_MINUS_SRC_ALPHA)), GpuFormat.RGBA8_UNORM, 7))
++        .build());
++    // Stage 4 (Tessera sun glare): analytic overexposed sun glow, added onto the frame in the screen-effects pass.
++    // screenquad vertex shaders: a vertex stage that reads (the Tessera block, a texture) stalls its pass (~1.4 ms measured)
++    public static final RenderPipeline TESSERA_SUN_GLARE = register(tesseraDefine(RenderPipeline.builder()
++            .withLocation("pipeline/tessera_sun_glare")
++            .withVertexShader("core/screenquad")
++            .withFragmentShader("core/tessera_sun_glare")
++            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++                .withUniform("InSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("SunVisSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build()))
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(new ColorTargetState(Optional.of(BlendFunction.ADDITIVE), GpuFormat.RGBA8_UNORM, 7))
++        .build());
++    // the sun's visibility for the glare, into one pixel (r)
++    public static final RenderPipeline TESSERA_SUN_VIS = register(tesseraDefine(RenderPipeline.builder()
++            .withLocation("pipeline/tessera_sun_vis")
++            .withVertexShader("core/screenquad")
++            .withFragmentShader("core/tessera_sun_vis")
++            .withBindGroupLayout(BindGroupLayouts.IN_SAMPLER))
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(new ColorTargetState(Optional.empty(), GpuFormat.RGBA8_UNORM, 15))
++        .build());
++    public static final RenderPipeline TESSERA_AO_APPLY = register(RenderPipeline.builder()
++        .withLocation("pipeline/tessera_ao_apply")
++        .withVertexShader("core/screenquad")
++        .withFragmentShader("core/tessera_ao_apply")
++        .withBindGroupLayout(BindGroupLayouts.IN_SAMPLER)
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(new ColorTargetState(Optional.of(new BlendFunction(
++            com.mojang.renderpearl.api.pipeline.BlendFactor.DST_COLOR, com.mojang.renderpearl.api.pipeline.BlendFactor.ZERO)), GpuFormat.RGBA8_UNORM, 7))
++        .build());
++    // Stage 4 (Tessera FXAA): edges of the finished world image, from a copy of it.
++    // Stage 4 (Tessera TAA): the jittered frame resolved into the history (RGBA8, dithered), then copied back onto the frame
++    public static final RenderPipeline TESSERA_TAA = register(tesseraDefine(RenderPipeline.builder()
++            .withLocation("pipeline/tessera_taa")
++            .withVertexShader("core/screenquad")
++            .withFragmentShader("core/tessera_taa")
++            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++                .withUniform("InSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("HistSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("DistSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build()))
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(new ColorTargetState(Optional.empty(), GpuFormat.RGBA8_UNORM, 15))
++        .build());
++    // the TAA with the AO multiplied in before the blend (the composites over its result then skip the AO)
++    public static final RenderPipeline TESSERA_TAA_AO = register(tesseraDefine(RenderPipeline.builder()
++            .withLocation("pipeline/tessera_taa_ao")
++            .withVertexShader("core/screenquad")
++            .withFragmentShader("core/tessera_taa")
++            .withShaderDefine("TESSERA_AO")
++            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++                .withUniform("InSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("HistSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("DistSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("AoSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build()))
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(new ColorTargetState(Optional.empty(), GpuFormat.RGBA8_UNORM, 15))
++        .build());
++    public static final RenderPipeline TESSERA_COPY = register(RenderPipeline.builder()
++        .withLocation("pipeline/tessera_copy")
++        .withVertexShader("core/screenquad")
++        .withFragmentShader("core/tessera_copy")
++        .withBindGroupLayout(BindGroupLayouts.IN_SAMPLER)
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(new ColorTargetState(Optional.empty(), GpuFormat.RGBA8_UNORM, 7))
++        .build());
++    public static final RenderPipeline RENDER_SCALE_UP = register(RenderPipeline.builder()
++        .withLocation("pipeline/render_scale_up")
++        .withVertexShader("core/screenquad")
++        .withFragmentShader("core/render_scale_up")
++        .withBindGroupLayout(BindGroupLayouts.IN_SAMPLER)
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(new ColorTargetState(Optional.empty(), GpuFormat.RGBA8_UNORM, 15))
++        .build());
++    public static final RenderPipeline TESSERA_FXAA = register(RenderPipeline.builder()
++        .withLocation("pipeline/tessera_fxaa")
++        .withVertexShader("core/screenquad")
++        .withFragmentShader("core/tessera_fxaa")
++        .withBindGroupLayout(BindGroupLayouts.IN_SAMPLER)
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(new ColorTargetState(Optional.empty(), GpuFormat.RGBA8_UNORM, 7))
++        .build());
++    public static final RenderPipeline TESSERA_BLOOM_BRIGHT = tesseraBloom("pipeline/tessera_bloom_bright", "core/tessera_bloom_down", "TESSERA_BRIGHT", false);
++    // the coarser levels in one pass (tiles side by side), then added onto the first level in one (ADDITIVE)
++    public static final RenderPipeline TESSERA_BLOOM_TILES = tesseraBloom("pipeline/tessera_bloom_tiles", "core/tessera_bloom_tiles", null, false);
++    public static final RenderPipeline TESSERA_BLOOM_COMBINE = tesseraBloom("pipeline/tessera_bloom_combine", "core/tessera_bloom_combine", null, true);
++    public static final RenderPipeline TESSERA_BLOOM_DOWN = tesseraBloom("pipeline/tessera_bloom_down", "core/tessera_bloom_down", null, false);
++    public static final RenderPipeline TESSERA_BLOOM_UP = tesseraBloom("pipeline/tessera_bloom_up", "core/tessera_bloom_up", null, true);
++    public static final RenderPipeline TESSERA_BLOOM_COMPOSITE = tesseraBloom("pipeline/tessera_bloom_composite", "core/tessera_bloom_up", "TESSERA_COMPOSITE", true);
++    // the composite with the AO multiplied in too (one full-resolution blend instead of two): AoSampler = the half-res AO
++    // the composites over the TAA result (BaseSampler): the whole frame written, no blend
++    public static final RenderPipeline TESSERA_BLOOM_COMPOSITE_TAA = register(RenderPipeline.builder()
++        .withLocation("pipeline/tessera_bloom_composite_taa")
++        .withVertexShader("core/screenquad")
++        .withFragmentShader("core/tessera_bloom_up")
++        .withShaderDefine("TESSERA_COMPOSITE")
++        .withShaderDefine("TESSERA_TAA_BASE")
++        .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++            .withUniform("InSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++            .withUniform("BaseSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build())
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(new ColorTargetState(Optional.empty(), GpuFormat.RGBA8_UNORM, 7))
++        .build());
++    public static final RenderPipeline TESSERA_BLOOM_COMPOSITE_AO_TAA = register(RenderPipeline.builder()
++        .withLocation("pipeline/tessera_bloom_composite_ao_taa")
++        .withVertexShader("core/screenquad")
++        .withFragmentShader("core/tessera_bloom_up")
++        .withShaderDefine("TESSERA_COMPOSITE")
++        .withShaderDefine("TESSERA_AO")
++        .withShaderDefine("TESSERA_TAA_BASE")
++        .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++            .withUniform("InSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++            .withUniform("AoSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++            .withUniform("BaseSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build())
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(new ColorTargetState(Optional.empty(), GpuFormat.RGBA8_UNORM, 7))
++        .build());
++    public static final RenderPipeline TESSERA_BLOOM_COMPOSITE_AO = register(RenderPipeline.builder()
++        .withLocation("pipeline/tessera_bloom_composite_ao")
++        .withVertexShader("core/screenquad")
++        .withFragmentShader("core/tessera_bloom_up")
++        .withShaderDefine("TESSERA_COMPOSITE")
++        .withShaderDefine("TESSERA_AO")
++        .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++            .withUniform("InSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++            .withUniform("AoSampler", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build())
++        .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++        .withCull(false)
++        .withColorTargetState(new ColorTargetState(Optional.of(new BlendFunction(com.mojang.renderpearl.api.pipeline.BlendFactor.ONE,
++            com.mojang.renderpearl.api.pipeline.BlendFactor.ONE_MINUS_SRC_ALPHA)), GpuFormat.RGBA8_UNORM, 7))
++        .build());
++
++    /** Full-resolution exact far-layer composite. No blending or filtering; keep per-layer GEQUAL order. */
++    public static final RenderPipeline LOD_REUSE_COMPOSITE = register(
++        RenderPipeline.builder()
++            .withLocation("pipeline/lod_reuse_composite")
++            .withVertexShader("core/screenquad")
++            .withFragmentShader("core/lod_reuse")
++            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++                .withUniform("ReuseColor", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("ReuseDepth", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER)
++                .withUniform("ReuseWarp", com.mojang.renderpearl.api.pipeline.UniformType.UNIFORM_BUFFER).build())
++            .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++            .withCull(false)
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .withDepthStencilState(DepthStencilState.DEFAULT)
++            .build()
++    );
++
++    // Stage-2 terrain S5: compact 16-byte vertex variants (see the header). Same snippets, states and defines as the
++    // vanilla pipelines above, plus vertex binding 0 = TerrainCompact.FORMAT and the TERRAIN_COMPACT define.
++    public static final RenderPipeline SOLID_TERRAIN_COMPACT = register(
++        RenderPipeline.builder(TERRAIN_SNIPPET)
++            .withLocation("pipeline/solid_terrain_compact")
++            .withVertexBinding(0, TerrainCompact.FORMAT)
++            .withShaderDefine("TERRAIN_COMPACT")
++            .withColorTargetState(ColorTargetState.DEFAULT)
+             .build()
+     );
++    public static final RenderPipeline SOLID_TERRAIN_COMPACT_MULTIDRAW = register(
++        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation("pipeline/solid_terrain_compact_multidraw")
++            .withVertexBinding(0, TerrainCompact.FORMAT)
++            .withShaderDefine("TERRAIN_COMPACT")
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
++    public static final RenderPipeline CUTOUT_TERRAIN_COMPACT = register(
++        RenderPipeline.builder(TERRAIN_SNIPPET)
++            .withLocation("pipeline/cutout_terrain_compact")
++            .withVertexBinding(0, TerrainCompact.FORMAT)
++            .withShaderDefine("TERRAIN_COMPACT")
++            .withShaderDefine("ALPHA_CUTOUT", 0.5F)
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
++    public static final RenderPipeline CUTOUT_TERRAIN_COMPACT_MULTIDRAW = register(
++        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation("pipeline/cutout_terrain_compact_multidraw")
++            .withVertexBinding(0, TerrainCompact.FORMAT)
++            .withShaderDefine("TERRAIN_COMPACT")
++            .withShaderDefine("ALPHA_CUTOUT", 0.5F)
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
++    public static final RenderPipeline WIREFRAME_COMPACT = registerOptional(
++        RenderPipeline.builder(TERRAIN_SNIPPET)
++            .withLocation("pipeline/wireframe_compact")
++            .withVertexBinding(0, TerrainCompact.FORMAT)
++            .withShaderDefine("TERRAIN_COMPACT")
++            .withPolygonMode(PolygonMode.WIREFRAME)
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
++    public static final RenderPipeline WIREFRAME_COMPACT_MULTIDRAW = registerOptional(
++        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation("pipeline/wireframe_compact_multidraw")
++            .withVertexBinding(0, TerrainCompact.FORMAT)
++            .withShaderDefine("TERRAIN_COMPACT")
++            .withPolygonMode(PolygonMode.WIREFRAME)
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
+ 
++    // Round 12 (a) (CONTRACT 16.R12-A, chunk/TerrainClusters): SOLID / CUTOUT multidraw terrain drawn from the GPU cluster cull.
++    // Same snippet, states and defines as the multidraw pipelines plus the TERRAIN_CLUSTER define; on Metal the vertex stage is
++    // TerrainVertexMsl#clusterVertex (vertex pulling; the quad list and cluster items come in vertex buffer slots 2 and 3, which
++    // the vertex format does not declare). Built unless -Dmc.terrain.clusters=false (default on since r12).
++    public static final @Nullable RenderPipeline SOLID_TERRAIN_CLUSTER = !net.minecraft.client.renderer.chunk.TerrainClusters.BUILD ? null : register(
++        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation("pipeline/solid_terrain_cluster")
++            .withShaderDefine("TERRAIN_CLUSTER")
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
++    public static final @Nullable RenderPipeline CUTOUT_TERRAIN_CLUSTER = !net.minecraft.client.renderer.chunk.TerrainClusters.BUILD ? null : register(
++        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation("pipeline/cutout_terrain_cluster")
++            .withShaderDefine("TERRAIN_CLUSTER")
++            .withShaderDefine("ALPHA_CUTOUT", 0.5F)
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
++
++    // Round 12 Part B (prototype, chunk/TerrainGreedy): SOLID / CUTOUT multidraw terrain drawing greedy copies (TERRAIN_GREEDY:
++    // UV2 high bytes = atlas tile + 1, UVs wrapped into the tile in the fragment stage). Built only with -Dmc.terrain.greedy.
++    public static final @Nullable RenderPipeline SOLID_TERRAIN_GREEDY_MULTIDRAW = !net.minecraft.client.renderer.chunk.TerrainGreedy.BUILD ? null : register(
++        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation("pipeline/solid_terrain_greedy_multidraw")
++            .withShaderDefine("TERRAIN_GREEDY")
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
++    public static final @Nullable RenderPipeline CUTOUT_TERRAIN_GREEDY_MULTIDRAW = !net.minecraft.client.renderer.chunk.TerrainGreedy.BUILD ? null : register(
++        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation("pipeline/cutout_terrain_greedy_multidraw")
++            .withShaderDefine("TERRAIN_GREEDY")
++            .withShaderDefine("ALPHA_CUTOUT", 0.5F)
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
++
++    // Stage 4 (Tessera): sun shadow casters (no culling: the light sees faces the camera culls), the terrain lightmap copy
++    // Built only with -Dmc.shaders=true.
++    private static @Nullable RenderPipeline tesseraShadow(final String location, final boolean compact, final boolean cutout) {
++        if (!Tessera.ENABLED) {
++            return null;
++        }
++        RenderPipeline.Builder b = RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation(location)
++            .withShaderDefine("TESSERA_SHADOW")
++            .withCull(false)
++            .withColorTargetState(ColorTargetState.DEFAULT);
++        if (compact) {
++            b = b.withVertexBinding(0, TerrainCompact.FORMAT).withShaderDefine("TERRAIN_COMPACT");
++        }
++        if (cutout) {
++            b = b.withShaderDefine("ALPHA_CUTOUT", 0.5F);
++        }
++        return register(b.build());
++    }
++    public static final @Nullable RenderPipeline TESSERA_SHADOW_SOLID = tesseraShadow("pipeline/tessera_shadow_solid", false, false);
++    public static final @Nullable RenderPipeline TESSERA_SHADOW_CUTOUT = tesseraShadow("pipeline/tessera_shadow_cutout", false, true);
++    public static final @Nullable RenderPipeline TESSERA_SHADOW_SOLID_COMPACT = tesseraShadow("pipeline/tessera_shadow_solid_compact", true, false);
++    public static final @Nullable RenderPipeline TESSERA_SHADOW_CUTOUT_COMPACT = tesseraShadow("pipeline/tessera_shadow_cutout_compact", true, true);
++    public static final @Nullable RenderPipeline TESSERA_LIGHTMAP = !Tessera.ENABLED ? null : register(
++        RenderPipeline.builder()
++            .withLocation("pipeline/tessera_lightmap")
++            .withVertexShader("core/screenquad")
++            .withFragmentShader("core/tessera_lightmap")
++            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++                .withUniform("Lightmap", com.mojang.renderpearl.api.pipeline.UniformType.COMBINED_IMAGE_SAMPLER).build())
++            .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
++            .withCull(false)
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
++
++    /** Round 12 Part B: the greedy pipeline of a SOLID / CUTOUT multidraw terrain pipeline, or null. */
++    public static @Nullable RenderPipeline greedyTerrainVariant(final RenderPipeline pipeline) {
++        if (pipeline == SOLID_TERRAIN_MULTIDRAW) {
++            return SOLID_TERRAIN_GREEDY_MULTIDRAW;
++        } else if (pipeline == CUTOUT_TERRAIN_MULTIDRAW) {
++            return CUTOUT_TERRAIN_GREEDY_MULTIDRAW;
++        } else {
++            return null;
++        }
++    }
++
++    // Stage 3 (chunk/Lod, docs/stage3/LOD-DESIGN.md §5.3): LOD water and other translucent LOD quads through the cluster path,
++    // unsorted (vanilla's translucent state and defines). Built only with -Dmc.lod=true.
++    public static final @Nullable RenderPipeline TRANSLUCENT_TERRAIN_CLUSTER = !net.minecraft.client.renderer.chunk.Lod.BUILD
++        || !net.minecraft.client.renderer.chunk.TerrainClusters.BUILD ? null : register(
++        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation("pipeline/translucent_terrain_cluster")
++            .withShaderDefine("TERRAIN_CLUSTER")
++            .withColorTargetState(new ColorTargetState(BlendFunction.TRANSLUCENT))
++            .withShaderDefine("ALPHA_CUTOUT", 0.1F)
++            .build()
++    );
++
++    // Stage 3 round 1b (chunk/LodGreedy): the LOD cluster pipelines with the greedy wrap (TERRAIN_CLUSTER + TERRAIN_GREEDY:
++    // merged LOD faces carry their atlas tile in UV2's high bytes). Vertex stage: TerrainVertexMsl#clusterVertexGreedy.
++    private static final boolean LOD_GREEDY = net.minecraft.client.renderer.chunk.Lod.BUILD && net.minecraft.client.renderer.chunk.Lod.MERGE
++        && net.minecraft.client.renderer.chunk.TerrainClusters.BUILD;
++    public static final @Nullable RenderPipeline SOLID_LOD_GREEDY_CLUSTER = !LOD_GREEDY ? null : register(
++        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation("pipeline/solid_lod_greedy_terrain_cluster")
++            .withShaderDefine("TERRAIN_CLUSTER")
++            .withShaderDefine("TERRAIN_GREEDY")
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
++    public static final @Nullable RenderPipeline CUTOUT_LOD_GREEDY_CLUSTER = !LOD_GREEDY ? null : register(
++        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation("pipeline/cutout_lod_greedy_terrain_cluster")
++            .withShaderDefine("TERRAIN_CLUSTER")
++            .withShaderDefine("TERRAIN_GREEDY")
++            .withShaderDefine("ALPHA_CUTOUT", 0.5F)
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
++    public static final @Nullable RenderPipeline TRANSLUCENT_LOD_GREEDY_CLUSTER = !LOD_GREEDY ? null : register(
++        tesseraWater(RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET))
++            .withLocation("pipeline/translucent_lod_greedy_terrain_cluster")
++            .withShaderDefine("TERRAIN_CLUSTER")
++            .withShaderDefine("TERRAIN_GREEDY")
++            .withColorTargetState(new ColorTargetState(BlendFunction.TRANSLUCENT))
++            .withShaderDefine("ALPHA_CUTOUT", 0.1F)
++            .build()
++    );
++    private static boolean lodGreedyWarned;
++
++    // Stage 3 round 2 (chunk/LodCompact): the LOD cluster pipelines of compact quad records (48 bytes per quad), same
++    // fragment stage as the greedy ones. Vertex stage: TerrainVertexMsl#clusterVertexCompact.
++    private static final boolean LOD_COMPACT = LOD_GREEDY && net.minecraft.client.renderer.chunk.LodCompact.ENABLED;
++    public static final @Nullable RenderPipeline SOLID_LOD_COMPACT_CLUSTER = !LOD_COMPACT ? null : register(
++        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation("pipeline/solid_lod_compact_terrain_cluster")
++            .withShaderDefine("TERRAIN_CLUSTER")
++            .withShaderDefine("TERRAIN_GREEDY")
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
++    public static final @Nullable RenderPipeline CUTOUT_LOD_COMPACT_CLUSTER = !LOD_COMPACT ? null : register(
++        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation("pipeline/cutout_lod_compact_terrain_cluster")
++            .withShaderDefine("TERRAIN_CLUSTER")
++            .withShaderDefine("TERRAIN_GREEDY")
++            .withShaderDefine("ALPHA_CUTOUT", 0.5F)
++            .withColorTargetState(ColorTargetState.DEFAULT)
++            .build()
++    );
++    public static final @Nullable RenderPipeline TRANSLUCENT_LOD_COMPACT_CLUSTER = !LOD_COMPACT ? null : register(
++        tesseraWater(RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET))
++            .withLocation("pipeline/translucent_lod_compact_terrain_cluster")
++            .withShaderDefine("TERRAIN_CLUSTER")
++            .withShaderDefine("TERRAIN_GREEDY")
++            .withColorTargetState(new ColorTargetState(BlendFunction.TRANSLUCENT))
++            .withShaderDefine("ALPHA_CUTOUT", 0.1F)
++            .build()
++    );
++    private static boolean lodCompactWarned;
++
++    // Stage 3 r3 (CONTRACT 16.S3-LOD-R3, chunk/LodGpu): LOD occlusion box queries after the opaque LOD: no colour or depth
++    // writes, depth test GEQUAL, no culling; both stages hand-written (TerrainVertexMsl#lodOcclusion), the fragment stage marks
++    // the cluster's entry of the LodOcclusion buffer visible.
++    public static final @Nullable RenderPipeline LOD_OCCLUSION = !LOD_GREEDY || !net.minecraft.client.renderer.chunk.Lod.OCCLUSION ? null : register(
++        RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation("pipeline/lod_occlusion_terrain_cluster")
++            .withFragmentShader("core/lod_occlusion")
++            .withShaderDefine("TERRAIN_CLUSTER")
++            .withShaderDefine("TERRAIN_GREEDY")
++            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
++                .withUniform("LodOcclusion", com.mojang.renderpearl.api.pipeline.UniformType.UNIFORM_BUFFER).build())
++            .withColorTargetState(new ColorTargetState(java.util.Optional.empty(), com.mojang.renderpearl.api.GpuFormat.RGBA8_UNORM, ColorTargetState.WRITE_NONE))
++            .withDepthStencilState(new com.mojang.renderpearl.api.pipeline.DepthStencilState(com.mojang.renderpearl.api.pipeline.CompareOp.GREATER_THAN_OR_EQUAL, false))
++            .withCull(false)
++            .build()
++    );
++
++    /** Stage 3 r3: the LOD occlusion box pipeline, or null (not built / not ready). */
++    public static @Nullable RenderPipeline lodOcclusionPipeline() {
++        RenderPipeline p = LOD_OCCLUSION;
++        return p != null && com.mojang.renderpearl.backend.metal.TerrainVertexMsl.clusterPipelineReady(p.getLocation().toString()) ? p : null;
++    }
++
++    // Stage 3 round 2 (smooth level transitions): the same LOD pipelines with LOD_FADE (core/terrain.fsh: the dissolve's
++    // discard), used only for the sections that are fading (chunk/LodGpu), so the opaque LOD keeps the discard-free shader.
++    private static @Nullable RenderPipeline lodFadePipeline(final String location, final int layer) {
++        RenderPipeline.Builder b = RenderPipeline.builder(MULTIDRAW_TERRAIN_SNIPPET)
++            .withLocation(location)
++            .withShaderDefine("TERRAIN_CLUSTER")
++            .withShaderDefine("TERRAIN_GREEDY")
++            .withShaderDefine("LOD_FADE");
++        if (layer == 1) {
++            b = b.withShaderDefine("ALPHA_CUTOUT", 0.5F);
++        } else if (layer == 2) {
++            b = tesseraWater(b.withShaderDefine("ALPHA_CUTOUT", 0.1F));
++        }
++        return register(b.withColorTargetState(layer == 2 ? new ColorTargetState(BlendFunction.TRANSLUCENT) : ColorTargetState.DEFAULT).build());
++    }
++
++    private static final @Nullable RenderPipeline[] LOD_GREEDY_FADE = !LOD_GREEDY ? new RenderPipeline[3] : new RenderPipeline[]{
++        lodFadePipeline("pipeline/solid_lod_greedy_fade_terrain_cluster", 0), lodFadePipeline("pipeline/cutout_lod_greedy_fade_terrain_cluster", 1),
++        lodFadePipeline("pipeline/translucent_lod_greedy_fade_terrain_cluster", 2)};
++    private static final @Nullable RenderPipeline[] LOD_COMPACT_FADE = !LOD_COMPACT ? new RenderPipeline[3] : new RenderPipeline[]{
++        lodFadePipeline("pipeline/solid_lod_compact_fade_terrain_cluster", 0), lodFadePipeline("pipeline/cutout_lod_compact_fade_terrain_cluster", 1),
++        lodFadePipeline("pipeline/translucent_lod_compact_fade_terrain_cluster", 2)};
++
++    /** Stage 3 round 2: the LOD pipeline for draw code {@code layer | 8 (compact) | 16 (fading)}, or null when not ready. */
++    public static @Nullable RenderPipeline lodPipeline(final int code) {
++        net.minecraft.client.renderer.chunk.ChunkSectionLayer layer = net.minecraft.client.renderer.chunk.ChunkSectionLayer.values()[code & 7];
++        boolean compact = (code & 8) != 0;
++        if ((code & 16) == 0) {
++            return compact ? lodCompactPipeline(layer) : lodClusterPipeline(layer);
++        }
++        RenderPipeline p = (compact ? LOD_COMPACT_FADE : LOD_GREEDY_FADE)[code & 7];
++        return p != null && com.mojang.renderpearl.backend.metal.TerrainVertexMsl.clusterPipelineReady(p.getLocation().toString()) ? p : null;
++    }
++
++    /** Stage 3 round 2: the pipeline compact LOD records of {@code layer} are drawn with, or null (not built / not ready). */
++    public static @Nullable RenderPipeline lodCompactPipeline(final net.minecraft.client.renderer.chunk.ChunkSectionLayer layer) {
++        RenderPipeline p = switch (layer) {
++            case SOLID -> SOLID_LOD_COMPACT_CLUSTER;
++            case CUTOUT -> CUTOUT_LOD_COMPACT_CLUSTER;
++            case TRANSLUCENT -> TRANSLUCENT_LOD_COMPACT_CLUSTER;
++        };
++        if (p != null && com.mojang.renderpearl.backend.metal.TerrainVertexMsl.clusterPipelineReady(p.getLocation().toString())) {
++            return p;
++        }
++        if (p != null && !lodCompactWarned) {
++            lodCompactWarned = true;
++            com.mojang.logging.LogUtils.getLogger().warn("[lod] compact LOD pipeline {} not ready: compact LOD records not drawn", layer);
++        }
++        return null;
++    }
++
++    /** Stage 3: the cluster pipeline LOD clusters of {@code layer} are drawn with, or null (not built / not ready). */
++    public static @Nullable RenderPipeline lodClusterPipeline(final net.minecraft.client.renderer.chunk.ChunkSectionLayer layer) {
++        if (LOD_GREEDY) {
++            RenderPipeline g = switch (layer) {
++                case SOLID -> SOLID_LOD_GREEDY_CLUSTER;
++                case CUTOUT -> CUTOUT_LOD_GREEDY_CLUSTER;
++                case TRANSLUCENT -> TRANSLUCENT_LOD_GREEDY_CLUSTER;
++            };
++            if (g != null && com.mojang.renderpearl.backend.metal.TerrainVertexMsl.clusterPipelineReady(g.getLocation().toString())) {
++                return g;
++            }
++            if (!lodGreedyWarned) {
++                lodGreedyWarned = true;
++                com.mojang.logging.LogUtils.getLogger().warn("[lod] greedy LOD pipeline {} not ready: merged LOD faces drawn without the tile wrap", layer);
++            }
++        }
++        RenderPipeline p = switch (layer) {
++            case SOLID -> SOLID_TERRAIN_CLUSTER;
++            case CUTOUT -> CUTOUT_TERRAIN_CLUSTER;
++            case TRANSLUCENT -> TRANSLUCENT_TERRAIN_CLUSTER;
++        };
++        return p != null && com.mojang.renderpearl.backend.metal.TerrainVertexMsl.clusterPipelineReady(p.getLocation().toString()) ? p : null;
++    }
++
++    /** Round 12 (a): the cluster pipeline of a SOLID / CUTOUT multidraw terrain pipeline, or null. */
++    public static @Nullable RenderPipeline clusterTerrainVariant(final RenderPipeline pipeline) {
++        if (pipeline == SOLID_TERRAIN_MULTIDRAW) {
++            return SOLID_TERRAIN_CLUSTER;
++        } else if (pipeline == CUTOUT_TERRAIN_MULTIDRAW) {
++            return CUTOUT_TERRAIN_CLUSTER;
++        } else {
++            return null;
++        }
++    }
++
++    /**
++     * Stage-2 terrain S5: the compact-vertex variant of a SOLID/CUTOUT terrain pipeline or of the debug wireframe
++     * (multidraw or not), or null when there is none (translucent, OIT).
++     */
++    public static @Nullable RenderPipeline compactTerrainVariant(final RenderPipeline pipeline) {
++        if (Tessera.ENABLED && pipeline == TESSERA_SHADOW_SOLID) {
++            return TESSERA_SHADOW_SOLID_COMPACT;
++        } else if (Tessera.ENABLED && pipeline == TESSERA_SHADOW_CUTOUT) {
++            return TESSERA_SHADOW_CUTOUT_COMPACT;
++        } else if (pipeline == SOLID_TERRAIN) {
++            return SOLID_TERRAIN_COMPACT;
++        } else if (pipeline == SOLID_TERRAIN_MULTIDRAW) {
++            return SOLID_TERRAIN_COMPACT_MULTIDRAW;
++        } else if (pipeline == CUTOUT_TERRAIN) {
++            return CUTOUT_TERRAIN_COMPACT;
++        } else if (pipeline == CUTOUT_TERRAIN_MULTIDRAW) {
++            return CUTOUT_TERRAIN_COMPACT_MULTIDRAW;
++        } else if (pipeline == WIREFRAME) {
++            return WIREFRAME_COMPACT;
++        } else if (pipeline == WIREFRAME_MULTIDRAW) {
++            return WIREFRAME_COMPACT_MULTIDRAW;
++        } else {
++            return null;
++        }
++    }
++
+     private static RenderPipeline register(final RenderPipeline pipeline) {
+         PIPELINES_BY_LOCATION.put(pipeline.getLocation(), pipeline);
+         return pipeline;

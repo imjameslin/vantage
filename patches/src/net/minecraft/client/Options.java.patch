@@ -1,0 +1,93 @@
+--- a/net/minecraft/client/Options.java
++++ b/net/minecraft/client/Options.java
+@@ -232,6 +232,59 @@
+         this.setGraphicsPresetToCustom();
+     });
+     private static final Component GRAPHICS_TOOLTIP_CHUNK_FADE = Component.translatable("options.chunkFade.tooltip");
++    private static final Component FARSIGHT_TOOLTIP = Component.translatable("options.farsight.tooltip");
++    private static final Component SHADERS_TOOLTIP = Component.translatable("options.tesseraShaders.tooltip");
++    /** Farsight far terrain on or off (default). Read once at startup (Minecraft sets mc.lod from it unless given). */
++    private final OptionInstance<Boolean> farsight = OptionInstance.createBoolean(
++        "options.farsight", OptionInstance.cachedConstantTooltip(FARSIGHT_TOOLTIP), false);
++    /** The Tessera shaders on or off (default). Read once at startup (Minecraft sets mc.shaders from it unless given). */
++    private final OptionInstance<Boolean> tesseraShaders = OptionInstance.createBoolean(
++        "options.tesseraShaders", OptionInstance.cachedConstantTooltip(SHADERS_TOOLTIP), false);
++
++    public OptionInstance<Boolean> farsight() {
++        return this.farsight;
++    }
++
++    public OptionInstance<Boolean> tesseraShaders() {
++        return this.tesseraShaders;
++    }
++
++    /** Farsight far-terrain quality 1-10 (Lod.qualityScale): 10 = finest far cells, each step down 1.25x coarser. Client-only. */
++    private final OptionInstance<Integer> farsightQuality = new OptionInstance<>(
++        "options.farsightQuality",
++        OptionInstance.noTooltip(),
++        (caption, value) -> genericValueLabel(caption, value),
++        new OptionInstance.IntRange(1, 10),
++        10,
++        OptionInstance.NO_ACTION
++    );
++
++    public OptionInstance<Integer> farsightQuality() {
++        return this.farsightQuality;
++    }
++
++    /** Render scale in percent (50-100): the world is drawn at this share of the window's resolution per axis and scaled up; the GUI stays native. Client-only. */
++    private final OptionInstance<Integer> renderScale = new OptionInstance<>(
++        "options.renderScale",
++        OptionInstance.noTooltip(),
++        (caption, value) -> genericValueLabel(caption, Component.literal(value * 5 + "%")),
++        new OptionInstance.IntRange(10, 20),
++        17,
++        OptionInstance.NO_ACTION
++    );
++
++    /** The slider (steps of 5 %). */
++    public OptionInstance<Integer> renderScale() {
++        return this.renderScale;
++    }
++
++    private static final int RENDER_SCALE_OVERRIDE = Integer.getInteger("mc.renderScale", 0);
++
++    /** Render scale in percent, 50-100 ({@code -Dmc.renderScale} overrides the option: tests). */
++    public int renderScalePercent() {
++        return RENDER_SCALE_OVERRIDE > 0 ? RENDER_SCALE_OVERRIDE : this.renderScale.get() * 5;
++    }
++
+     private final OptionInstance<Double> chunkSectionFadeInTime = new OptionInstance<>(
+         "options.chunkFade",
+         OptionInstance.cachedConstantTooltip(GRAPHICS_TOOLTIP_CHUNK_FADE),
+@@ -690,6 +743,11 @@
+     public final KeyMapping keyQuickActions = new KeyMapping("key.quickActions", 10, KeyMapping.Category.MISC);
+     public final KeyMapping keyToggleGui = new KeyMapping("key.toggleGui", 58, KeyMapping.Category.MISC);
+     public final KeyMapping keyToggleSpectatorShaderEffects = new KeyMapping("key.toggleSpectatorShaderEffects", 61, KeyMapping.Category.MISC);
++    /**
++     * Hold-to-zoom (docs/features/ZOOM.md). Default C (scancode 6) like OptiFine; shares C with keySaveHotbarActivator
++     * (KeyMapping.MAP keeps a list per key, so both fire). Saved as key_key.zoom in options.txt; client-only.
++     */
++    public final KeyMapping keyZoom = new KeyMapping("key.zoom", 6, KeyMapping.Category.MISC);
+     public final KeyMapping[] keyHotbarSlots = new KeyMapping[]{
+         new KeyMapping("key.hotbar.1", 30, KeyMapping.Category.INVENTORY),
+         new KeyMapping("key.hotbar.2", 31, KeyMapping.Category.INVENTORY),
+@@ -787,6 +845,7 @@
+                 this.keyScreenshot,
+                 this.keyTogglePerspective,
+                 this.keySmoothCamera,
++                this.keyZoom,
+                 this.keyFullscreen,
+                 this.keySpectatorOutlines,
+                 this.keySpectatorHotbar,
+@@ -1546,6 +1605,10 @@
+         access.process("ao", this.ambientOcclusion);
+         access.process("biomeBlendRadius", this.biomeBlendRadius);
+         access.process("chunkSectionFadeInTime", this.chunkSectionFadeInTime);
++        access.process("farsightQuality", this.farsightQuality);
++        access.process("renderScale", this.renderScale);
++        access.process("farsight", this.farsight);
++        access.process("tesseraShaders", this.tesseraShaders);
+         access.process("cutoutLeaves", this.cutoutLeaves);
+         access.process("enableVsync", this.enableVsync);
+         access.process("entityDistanceScaling", this.entityDistanceScaling);

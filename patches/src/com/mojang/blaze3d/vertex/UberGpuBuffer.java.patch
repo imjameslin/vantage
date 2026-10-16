@@ -1,0 +1,645 @@
+--- a/com/mojang/blaze3d/vertex/UberGpuBuffer.java
++++ b/com/mojang/blaze3d/vertex/UberGpuBuffer.java
+@@ -1,9 +1,26 @@
++// Patched copy of the vanilla 26.3 class (render-thread CPU work, docs/stage2/TERRAIN-PLAN.md S4 P1). Differences from
++// vanilla: an optional AllocationListener is told about every change of an allocation of allocationMap (put by
++// uploadStagedAllocations, remove by removeAllocation/freeAllocation, clear by close), with the heap buffer and offset
++// that getAllocation()/getGpuBuffer() would return. Without a listener (the default) behaviour is unchanged.
++// Debug accessors forEachAllocation()/reservedBytes() feed the terrain mesh memory report (-Dmc.terrain.meshStats).
++// TASK E (docs/metal/CONTRACT.md 16.R5-E, results/TAIL-ANALYSIS.md V2); pregrow default on since round 5 (16.R5-FIN), upload budget off:
++//  - pregrow (-Dmc.terrain.pregrow): one spare heap buffer per uber buffer, obtained ahead of need (HeapSource: the Metal
++//    heap-reserve thread) once the free bytes of the heaps fall below a low-water mark, or kept from a heap that became
++//    completely free while the free bytes stay at or below the high-water mark; a new heap takes the spare instead of
++//    creating a buffer in-frame. The spare is never in `nodes` before the moment vanilla creates a heap, so allocation
++//    placement, upload order, callbacks and the return value are exactly vanilla's; only the buffer object differs.
++//  - upload budget (-Dmc.terrain.uploadBudgetKB, SectionRenderDispatcher): uploadStagedAllocationsBudgeted uploads part
++//    of the staged entries and carries the rest over (bounded delay, see UploadBudget).
+ package com.mojang.blaze3d.vertex;
+ 
++import com.mojang.blaze3d.systems.RenderSystem;
+ import com.mojang.datafixers.util.Pair;
+ import com.mojang.renderpearl.api.buffers.GpuBuffer;
+ import com.mojang.renderpearl.api.device.GpuDevice;
++import com.mojang.renderpearl.backend.metal.MetalHeapReserve;
++import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
+ import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+ import it.unimi.dsi.fastutil.objects.ObjectIterator;
+ import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
+ import java.nio.ByteBuffer;
+@@ -14,12 +31,15 @@
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Map.Entry;
++import net.minecraft.client.renderer.chunk.TravelHitchToggles;
+ import net.minecraft.util.VisibleForDebug;
+ import net.minecraft.util.profiling.Profiler;
+ import net.minecraft.util.profiling.Zone;
+ import org.jspecify.annotations.Nullable;
+ 
+ public class UberGpuBuffer<T> implements AutoCloseable {
++    /** TASK E pregrow: bytes of the spare heap buffers held by every uber buffer (render thread). */
++    private static long spareBytesTotal;
+     private final @GpuBuffer.Usage int bufferUsage;
+     private final int heapSize;
+     private final int alignSize;
+@@ -29,6 +49,24 @@
+     private final Object2ObjectOpenHashMap<T, UberGpuBuffer.StagedAllocationEntry<? extends T>> stagedAllocations = new Object2ObjectOpenHashMap(32);
+     private final ObjectOpenHashSet<T> skippedStagedAllocations = new ObjectOpenHashSet(32);
+     private final Map<T, TlsfAllocator.Allocation> allocationMap = new HashMap<>(256);
++    private UberGpuBuffer.@Nullable AllocationListener<T> allocationListener;
++    // TASK E pregrow (all under the owner's lock; heap/spare changes on the render thread).
++    private boolean pregrow = TravelHitchToggles.PREGROW;
++    private UberGpuBuffer.HeapSource heapSource = UberGpuBuffer.HeapSource.METAL_RESERVE;
++    /** Sum of the block sizes of the allocations in allocationMap (maintained only while pregrow is on). */
++    private long usedBytes;
++    private @Nullable GpuBuffer spareHeapBuffer;
++    /** The spare came from a freed heap rather than from the heap source (statistics). */
++    private boolean spareKept;
++    private boolean heapChanged;
++    private long heapsCreatedInFrame;
++    private long sparesUsed;
++    /** Consecutive upload passes that found no heap while a spare was held (pregrow idle release). */
++    private int idleSparePasses;
++    private long sparesReleasedIdle;
++    // TASK E upload budget (null = vanilla uploads).
++    private UberGpuBuffer.@Nullable UploadBudget uploadBudget;
++    private final ObjectArrayList<T> uploadKeys = new ObjectArrayList<>();
+ 
+     public UberGpuBuffer(final String name, final @GpuBuffer.Usage int bufferUsage, final int heapSize, final int alignSize, final StagingBuffer stagingBuffer) {
+         this.name = "UberBuffer " + name;
+@@ -45,9 +83,21 @@
+         }
+ 
+         UberGpuBuffer.StagedAllocationEntry<U> entry = new UberGpuBuffer.StagedAllocationEntry<>(handle, callback);
++        UberGpuBuffer.UploadBudget budget = this.uploadBudget;
++        if (budget != null) {
++            entry.frame = budget.frame;
++            entry.urgent = RenderSystem.isOnRenderThread();
++        }
++
+         UberGpuBuffer.StagedAllocationEntry<? extends T> oldEntry = (UberGpuBuffer.StagedAllocationEntry<? extends T>)this.stagedAllocations
+             .put(allocationKey, entry);
+         if (oldEntry != null) {
++            if (budget != null) {
++                // A replaced carried entry keeps its age, so re-staging never extends the delay bound.
++                entry.frame = Math.min(entry.frame, oldEntry.frame);
++                entry.urgent |= oldEntry.urgent;
++            }
++
+             oldEntry.close();
+         }
+ 
+@@ -63,7 +113,7 @@
+             this.freeAllocation(key);
+         }
+ 
+-        boolean newHeapCreatedOrDestroyedx = false;
++        this.heapChanged = false;
+ 
+         try (Zone var22 = Profiler.get().zone("uploadStagedAllocations")) {
+             ObjectIterator node = this.stagedAllocations.entrySet().iterator();
+@@ -72,61 +122,246 @@
+                 Entry<T, UberGpuBuffer.StagedAllocationEntry<? extends T>> entry = (Entry<T, UberGpuBuffer.StagedAllocationEntry<? extends T>>)node.next();
+ 
+                 try (UberGpuBuffer.StagedAllocationEntry<? extends T> staged = entry.getValue()) {
+-                    long allocationSize = staged.buffer.size();
+                     if (!this.skippedStagedAllocations.contains(entry.getKey())) {
+-                        TlsfAllocator.Allocation allocation = null;
++                        this.uploadEntry(gpuDevice, uploader, entry.getKey(), staged);
++                    }
++                }
++            }
+ 
+-                        for (Pair<TlsfAllocator, UberGpuBuffer.UberGpuBufferHeap> nodex : this.nodes) {
+-                            allocation = ((TlsfAllocator)nodex.getFirst()).allocate(allocationSize, this.alignSize);
+-                            if (allocation != null) {
+-                                break;
+-                            }
+-                        }
++            this.stagedAllocations.clear();
++            this.skippedStagedAllocations.clear();
++        }
+ 
+-                        if (allocation == null) {
+-                            try (Zone var25 = Profiler.get().zone("createNewHeap")) {
+-                                assert allocationSize <= this.heapSize;
+-                                String heapName = String.format(Locale.ROOT, "%s %d", this.name, this.nodes.size());
+-                                UberGpuBuffer.UberGpuBufferHeap newHeap = new UberGpuBuffer.UberGpuBufferHeap(
+-                                    this.heapSize, gpuDevice, this.bufferUsage, heapName
+-                                );
+-                                TlsfAllocator newTlsfAllocator = new TlsfAllocator(newHeap);
+-                                this.nodes.add(new Pair(newTlsfAllocator, newHeap));
+-                                allocation = newTlsfAllocator.allocate(allocationSize, this.alignSize);
+-                                newHeapCreatedOrDestroyedx = true;
+-                            }
+-                        }
++        this.releaseOneFreeHeap();
++        if (this.pregrow) {
++            this.pregrowAfterUpload();
++        }
+ 
+-                        if (allocation != null) {
+-                            TlsfAllocator.Heap allocationHeap = allocation.getHeap();
+-                            GpuBuffer allocationDestBuffer = ((UberGpuBuffer.UberGpuBufferHeap)allocationHeap).gpuBuffer;
+-                            uploader.copyTo(staged.buffer, allocationDestBuffer, allocation.getOffsetFromHeap());
+-                            this.allocationMap.put(entry.getKey(), allocation);
+-                            runCallbackUnchecked(entry.getKey(), entry.getValue());
+-                        }
++        return this.heapChanged;
++    }
++
++    /**
++     * TASK E upload budget (render thread, owner's lock held): {@link #uploadStagedAllocations} restricted to the
++     * entries {@link UploadBudget#uploadsNow} picks; the others stay staged (carried over). In the vertex pass the
++     * carried keys are added to {@code carried}; the index pass of the same layer carries exactly those keys (so a
++     * section-layer's vertex and index data land in the same frame) and uploads every other entry (translucency
++     * re-sorts are never delayed). Entries of released meshes are dropped as in the vanilla pass, including those
++     * released by callbacks of this pass. With {@code budget.flush} every entry is uploaded, in vanilla's order.
++     */
++    public boolean uploadStagedAllocationsBudgeted(
++        final GpuDevice gpuDevice, final StagingBuffer.Uploader uploader, final UberGpuBuffer.UploadBudget budget, final boolean vertexPass, final ObjectOpenHashSet<T> carried
++    ) {
++        uploader.checkValidFor(this.stagingBuffer);
++        ObjectArrayList<T> keys = this.uploadKeys;
++        keys.clear();
++        ObjectIterator<Object2ObjectMap.Entry<T, UberGpuBuffer.StagedAllocationEntry<? extends T>>> iterator = this.stagedAllocations
++            .object2ObjectEntrySet()
++            .fastIterator();
++
++        while (iterator.hasNext()) {
++            Object2ObjectMap.Entry<T, UberGpuBuffer.StagedAllocationEntry<? extends T>> entry = iterator.next();
++            T key = entry.getKey();
++            if (this.skippedStagedAllocations.contains(key)) {
++                continue;
++            }
++
++            UberGpuBuffer.StagedAllocationEntry<? extends T> staged = entry.getValue();
++            if (budget.uploadsNow(staged.frame, staged.urgent, vertexPass, !vertexPass && carried.contains(key))) {
++                keys.add(key);
++                budget.remaining -= staged.buffer.size();
++            } else if (vertexPass) {
++                carried.add(key);
++            }
++        }
++
++        for (int i = 0; i < keys.size(); i++) {
++            this.freeAllocation(keys.get(i));
++        }
++
++        this.heapChanged = false;
++
++        try (Zone zone = Profiler.get().zone("uploadStagedAllocations")) {
++            for (int i = 0; i < keys.size(); i++) {
++                T key = keys.get(i);
++
++                try (UberGpuBuffer.StagedAllocationEntry<? extends T> staged = this.stagedAllocations.remove(key)) {
++                    if (!this.skippedStagedAllocations.contains(key)) {
++                        this.uploadEntry(gpuDevice, uploader, key, staged);
+                     }
+                 }
+             }
+ 
+-            this.stagedAllocations.clear();
+-            this.skippedStagedAllocations.clear();
++            if (!this.skippedStagedAllocations.isEmpty()) {
++                // Carried entries of meshes released before or during this pass are dropped, as vanilla drops them.
++                for (T key : this.skippedStagedAllocations) {
++                    UberGpuBuffer.StagedAllocationEntry<? extends T> staged = this.stagedAllocations.remove(key);
++                    if (staged != null) {
++                        staged.close();
++                    }
++                }
++
++                this.skippedStagedAllocations.clear();
++            }
+         }
+ 
++        keys.clear();
++        this.releaseOneFreeHeap();
++        if (this.pregrow) {
++            this.pregrowAfterUpload();
++        }
++
++        return this.heapChanged;
++    }
++
++    /** One staged entry of an upload pass: vanilla's allocate / create-heap / copy / map / callback sequence. */
++    private void uploadEntry(
++        final GpuDevice gpuDevice, final StagingBuffer.Uploader uploader, final T key, final UberGpuBuffer.StagedAllocationEntry<? extends T> staged
++    ) {
++        long allocationSize = staged.buffer.size();
++        TlsfAllocator.Allocation allocation = null;
++
++        for (Pair<TlsfAllocator, UberGpuBuffer.UberGpuBufferHeap> nodex : this.nodes) {
++            allocation = ((TlsfAllocator)nodex.getFirst()).allocate(allocationSize, this.alignSize);
++            if (allocation != null) {
++                break;
++            }
++        }
++
++        if (allocation == null) {
++            try (Zone var25 = Profiler.get().zone("createNewHeap")) {
++                assert allocationSize <= this.heapSize;
++                UberGpuBuffer.UberGpuBufferHeap newHeap;
++                GpuBuffer spare = this.spareHeapBuffer;
++                if (spare != null) {
++                    // TASK E pregrow: the heap vanilla creates here takes the spare buffer (created ahead / kept).
++                    this.dropSpare();
++                    newHeap = new UberGpuBuffer.UberGpuBufferHeap(this.heapSize, spare);
++                    this.sparesUsed++;
++                } else {
++                    String heapName = String.format(Locale.ROOT, "%s %d", this.name, this.nodes.size());
++                    newHeap = new UberGpuBuffer.UberGpuBufferHeap(this.heapSize, gpuDevice, this.bufferUsage, heapName);
++                    this.heapsCreatedInFrame++;
++                }
++
++                TlsfAllocator newTlsfAllocator = new TlsfAllocator(newHeap);
++                this.nodes.add(new Pair(newTlsfAllocator, newHeap));
++                allocation = newTlsfAllocator.allocate(allocationSize, this.alignSize);
++                this.heapChanged = true;
++            }
++        }
++
++        if (allocation != null) {
++            TlsfAllocator.Heap allocationHeap = allocation.getHeap();
++            GpuBuffer allocationDestBuffer = ((UberGpuBuffer.UberGpuBufferHeap)allocationHeap).gpuBuffer;
++            uploader.copyTo(staged.buffer, allocationDestBuffer, allocation.getOffsetFromHeap());
++            this.allocationMap.put(key, allocation);
++            if (this.pregrow) {
++                this.usedBytes += allocation.getSize();
++            }
++
++            this.notifyAllocation(key, allocation);
++            runCallbackUnchecked(key, staged);
++        }
++    }
++
++    /** Vanilla: at most one completely free heap per pass is destroyed (pregrow: kept as the spare when it is wanted). */
++    private void releaseOneFreeHeap() {
+         Iterator<Pair<TlsfAllocator, UberGpuBuffer.UberGpuBufferHeap>> iterator = this.nodes.iterator();
+ 
+         while (iterator.hasNext()) {
+             Pair<TlsfAllocator, UberGpuBuffer.UberGpuBufferHeap> node = iterator.next();
+             if (((TlsfAllocator)node.getFirst()).isCompletelyFree()) {
+-                ((UberGpuBuffer.UberGpuBufferHeap)node.getSecond()).gpuBuffer.close();
++                GpuBuffer freed = ((UberGpuBuffer.UberGpuBufferHeap)node.getSecond()).gpuBuffer;
+                 iterator.remove();
+-                newHeapCreatedOrDestroyedx = true;
++                if (this.pregrow && this.spareHeapBuffer == null && this.freeBytes() <= this.highWaterBytes() && this.spareFits()) {
++                    this.takeSpare(freed, true);
++                } else {
++                    freed.close();
++                }
++
++                this.heapChanged = true;
+                 break;
+             }
+         }
++    }
+ 
+-        return newHeapCreatedOrDestroyedx;
++    /**
++     * TASK E pregrow, end of an upload pass (render thread): below the low-water mark, collect a ready buffer from the
++     * heap source or ask it for one; above the high-water mark, give the spare back (close: a deferred release, ~0 ms).
++     * An uber buffer with no heap at all (a layer with no geometry in view) gives its spare back after
++     * {@link TravelHitchToggles#PREGROW_IDLE_PASSES} such passes in a row, so idle layers do not hold spares (counted in
++     * the global spare cap) that a growing layer needs. Allocation-free once the heap source has its class.
++     */
++    private void pregrowAfterUpload() {
++        long free = this.freeBytes();
++        if (this.spareHeapBuffer != null && this.nodes.isEmpty()) {
++            if (++this.idleSparePasses >= TravelHitchToggles.PREGROW_IDLE_PASSES) {
++                GpuBuffer spare = this.spareHeapBuffer;
++                this.dropSpare();
++                spare.close();
++                this.sparesReleasedIdle++;
++            }
++
++            return;
++        }
++
++        this.idleSparePasses = 0;
++        if (this.spareHeapBuffer == null) {
++            if (!this.nodes.isEmpty() && free < this.lowWaterBytes()) {
++                int usage = this.bufferUsage | 8 | 16;
++                if (this.spareFits()) {
++                    GpuBuffer ready = this.heapSource.poll(usage, this.heapSize);
++                    if (ready != null) {
++                        this.takeSpare(ready, false);
++                    } else {
++                        this.heapSource.request(usage, this.heapSize);
++                    }
++                }
++            }
++        } else if (free > this.highWaterBytes()) {
++            GpuBuffer spare = this.spareHeapBuffer;
++            this.dropSpare();
++            spare.close();
++        }
+     }
+ 
++    private boolean spareFits() {
++        return spareBytesTotal + this.heapSize <= TravelHitchToggles.PREGROW_MAX_SPARE_BYTES;
++    }
++
++    private void takeSpare(final GpuBuffer buffer, final boolean kept) {
++        this.spareHeapBuffer = buffer;
++        this.spareKept = kept;
++        spareBytesTotal += this.heapSize;
++    }
++
++    private void dropSpare() {
++        if (this.spareHeapBuffer != null) {
++            spareBytesTotal -= this.heapSize;
++        }
++
++        this.spareHeapBuffer = null;
++        this.spareKept = false;
++    }
++
++    /** Test seam (TASK E): bytes of spare heap buffers held over every uber buffer. */
++    @VisibleForDebug
++    public static long spareBytesTotal() {
++        return spareBytesTotal;
++    }
++
++    private long freeBytes() {
++        return (long)this.nodes.size() * this.heapSize - this.usedBytes;
++    }
++
++    private long lowWaterBytes() {
++        return (long)(this.heapSize * TravelHitchToggles.PREGROW_FREE);
++    }
++
++    private long highWaterBytes() {
++        return Math.min((long)this.heapSize, 3L * this.lowWaterBytes());
++    }
++
+     private static <T, U extends T> void runCallbackUnchecked(final T key, final UberGpuBuffer.StagedAllocationEntry<U> value) {
+         if (value.callback != null) {
+             value.callback.bufferHasBeenUploaded((U)key);
+@@ -145,6 +380,11 @@
+     private void freeAllocation(final T allocationKey) {
+         TlsfAllocator.Allocation allocation = this.allocationMap.remove(allocationKey);
+         if (allocation != null) {
++            if (this.pregrow) {
++                this.usedBytes -= allocation.getSize();
++            }
++
++            this.notifyAllocation(allocationKey, null);
+             for (Pair<TlsfAllocator, UberGpuBuffer.UberGpuBufferHeap> node : this.nodes) {
+                 if (node.getSecond() == allocation.getHeap()) {
+                     ((TlsfAllocator)node.getFirst()).free(allocation);
+@@ -158,7 +398,112 @@
+         return ((UberGpuBuffer.UberGpuBufferHeap)allocation.getHeap()).gpuBuffer;
+     }
+ 
++    /**
++     * Installs the listener that mirrors {@code allocationMap} (null removes it). It is called synchronously from
++     * whatever thread changes the map (the owner's lock is held there, see SectionRenderDispatcher.copyLock).
++     */
++    public void setAllocationListener(final UberGpuBuffer.@Nullable AllocationListener<T> allocationListener) {
++        this.allocationListener = allocationListener;
++    }
++
++    /** TASK E: the shared per-frame upload budget (null = vanilla). Set before the first allocation is staged. */
++    public void setUploadBudget(final UberGpuBuffer.@Nullable UploadBudget uploadBudget) {
++        this.uploadBudget = uploadBudget;
++    }
++
++    /** Test seam (TASK E): switches pregrow for this instance; only before the first allocation. */
+     @VisibleForDebug
++    public void setPregrowForTesting(final boolean pregrow, final UberGpuBuffer.HeapSource heapSource) {
++        if (!this.allocationMap.isEmpty() || !this.nodes.isEmpty()) {
++            throw new IllegalStateException("pregrow can only be switched on an empty uber buffer");
++        }
++
++        this.pregrow = pregrow;
++        this.heapSource = heapSource;
++    }
++
++    private void notifyAllocation(final T allocationKey, final TlsfAllocator.@Nullable Allocation allocation) {
++        UberGpuBuffer.AllocationListener<T> listener = this.allocationListener;
++        if (listener != null) {
++            if (allocation == null) {
++                listener.allocationChanged(allocationKey, null, 0L);
++            } else {
++                listener.allocationChanged(allocationKey, this.getGpuBuffer(allocation), allocation.getOffsetFromHeap());
++            }
++        }
++    }
++
++    /** Debug (terrain mesh memory report): every current allocation with its key. Same thread rules as the map. */
++    @VisibleForDebug
++    public void forEachAllocation(final java.util.function.BiConsumer<T, TlsfAllocator.Allocation> consumer) {
++        this.allocationMap.forEach(consumer);
++    }
++
++    /** Debug: bytes of GPU heap buffers currently created. */
++    @VisibleForDebug
++    public long reservedBytes() {
++        return (long)this.nodes.size() * this.heapSize;
++    }
++
++    /**
++     * Debug (TASK E; terrain mesh memory report with -Dmc.terrain.meshStats): heap buffers created inside an upload
++     * pass (counted with pregrow off too), spares used instead, whether a spare is held.
++     */
++    @VisibleForDebug
++    public String pregrowStats() {
++        return String.format(
++            Locale.ROOT, "heaps %d, created in-frame %d, spares used %d, spare %s", this.nodes.size(), this.heapsCreatedInFrame, this.sparesUsed,
++            this.spareHeapBuffer == null ? "none" : (this.spareKept ? "kept" : "reserved")
++        );
++    }
++
++    /** Test seam (TASK E): index in the heap list of the heap holding {@code key}'s allocation, or -1. */
++    @VisibleForDebug
++    public int heapIndex(final T key) {
++        TlsfAllocator.Allocation allocation = this.allocationMap.get(key);
++        if (allocation != null) {
++            for (int i = 0; i < this.nodes.size(); i++) {
++                if (this.nodes.get(i).getSecond() == allocation.getHeap()) {
++                    return i;
++                }
++            }
++        }
++
++        return -1;
++    }
++
++    @VisibleForDebug
++    public int heapCount() {
++        return this.nodes.size();
++    }
++
++    @VisibleForDebug
++    public long heapsCreatedInFrame() {
++        return this.heapsCreatedInFrame;
++    }
++
++    @VisibleForDebug
++    public long sparesUsed() {
++        return this.sparesUsed;
++    }
++
++    @VisibleForDebug
++    public boolean hasSpare() {
++        return this.spareHeapBuffer != null;
++    }
++
++    /** Test seam (TASK E): spares given back because the uber buffer had no heap for PREGROW_IDLE_PASSES passes. */
++    @VisibleForDebug
++    public long sparesReleasedIdle() {
++        return this.sparesReleasedIdle;
++    }
++
++    @VisibleForDebug
++    public int stagedCount() {
++        return this.stagedAllocations.size();
++    }
++
++    @VisibleForDebug
+     public void printStatistics() {
+         for (int i = 0; i < this.nodes.size(); i++) {
+             Pair<TlsfAllocator, UberGpuBuffer.UberGpuBufferHeap> node = this.nodes.get(i);
+@@ -171,16 +516,42 @@
+     public void close() {
+         this.stagedAllocations.values().forEach(UberGpuBuffer.StagedAllocationEntry::close);
+         this.stagedAllocations.clear();
++        if (this.allocationListener != null) {
++            for (T key : this.allocationMap.keySet()) {
++                this.notifyAllocation(key, null);
++            }
++        }
++
+         this.allocationMap.clear();
++        this.usedBytes = 0L;
+ 
+         for (Pair<TlsfAllocator, UberGpuBuffer.UberGpuBufferHeap> node : this.nodes) {
+             ((UberGpuBuffer.UberGpuBufferHeap)node.getSecond()).gpuBuffer.close();
+         }
+ 
+         this.nodes.clear();
++        this.idleSparePasses = 0;
++        GpuBuffer spare = this.spareHeapBuffer;
++        if (spare != null) {
++            this.dropSpare();
++            spare.close();
++        }
+     }
+ 
+-    private record StagedAllocationEntry<T>(StagingBuffer.BufferHandle buffer, UberGpuBuffer.@Nullable UploadCallback<T> callback) implements AutoCloseable {
++    /** Staged upload (vanilla record); {@code frame} / {@code urgent} are only used by the TASK E upload budget. */
++    private static final class StagedAllocationEntry<T> implements AutoCloseable {
++        private final StagingBuffer.BufferHandle buffer;
++        private final UberGpuBuffer.@Nullable UploadCallback<T> callback;
++        /** UploadBudget.frame when staged (the oldest staging if the entry replaced a carried one). */
++        private int frame;
++        /** Staged on the render thread (synchronous compile): never carried over. */
++        private boolean urgent;
++
++        private StagedAllocationEntry(final StagingBuffer.BufferHandle buffer, final UberGpuBuffer.@Nullable UploadCallback<T> callback) {
++            this.buffer = buffer;
++            this.callback = callback;
++        }
++
+         @Override
+         public void close() {
+             this.buffer.close();
+@@ -194,9 +565,94 @@
+             super(size);
+             this.gpuBuffer = gpuDevice.createBuffer(() -> name, usage | 8 | 16, size);
+         }
++
++        /** TASK E pregrow: a heap over an existing buffer of {@code size} bytes created with the heap usage. */
++        public UberGpuBufferHeap(final long size, final GpuBuffer gpuBuffer) {
++            super(size);
++            this.gpuBuffer = gpuBuffer;
++        }
+     }
+ 
+     public interface UploadCallback<T> {
+         void bufferHasBeenUploaded(T key);
+     }
++
++    /** Mirror of {@code allocationMap}: {@code buffer} null means the key has no allocation any more. */
++    public interface AllocationListener<T> {
++        void allocationChanged(T key, @Nullable GpuBuffer buffer, long offsetFromHeap);
++    }
++
++    /**
++     * TASK E pregrow: where spare heap buffers come from. {@link #request} never blocks and may do nothing;
++     * {@link #poll} returns a buffer created with exactly {@code usage} and {@code size}, or null. Render thread.
++     */
++    public interface HeapSource {
++        /** The Metal backend's heap-reserve thread (no-op on other backends and while the switch is off). */
++        UberGpuBuffer.HeapSource METAL_RESERVE = new UberGpuBuffer.HeapSource() {
++            @Override
++            public void request(final @GpuBuffer.Usage int usage, final long size) {
++                MetalHeapReserve.request(usage, size);
++            }
++
++            @Override
++            public @Nullable GpuBuffer poll(final @GpuBuffer.Usage int usage, final long size) {
++                return MetalHeapReserve.poll(usage, size);
++            }
++        };
++
++        void request(@GpuBuffer.Usage int usage, long size);
++
++        @Nullable GpuBuffer poll(@GpuBuffer.Usage int usage, long size);
++    }
++
++    /**
++     * TASK E per-frame upload budget ({@code -Dmc.terrain.uploadBudgetKB}), shared by every uber buffer of one
++     * SectionRenderDispatcher and mutated only under its copyLock. A frame's pass ({@link #beginFrame}) starts with
++     * {@link #budgetBytes}; a vertex-pass entry is uploaded while budget remains (the first entry always fits), when
++     * the frame flushes, when it was staged on the render thread, or once it is older than {@link #maxDelayFrames}
++     * frames, i.e. never more than maxDelayFrames frames after the pass vanilla would have uploaded it in.
++     */
++    public static final class UploadBudget {
++        public final long budgetBytes;
++        public final int maxDelayFrames;
++        /** Number of frame passes begun; an entry staged after pass f has frame f, vanilla uploads it in pass f + 1. */
++        public int frame;
++        public long remaining;
++        public boolean flush;
++        /** Statistics: carry decisions (an entry carried over k frames counts k times) / frame passes that flushed. */
++        public long carriedEntries;
++        public long flushedFrames;
++
++        public UploadBudget(final long budgetBytes, final int maxDelayFrames) {
++            this.budgetBytes = budgetBytes;
++            this.maxDelayFrames = maxDelayFrames;
++        }
++
++        public void beginFrame(final boolean flush) {
++            this.frame++;
++            this.remaining = this.budgetBytes;
++            this.flush = flush;
++            if (flush) {
++                this.flushedFrames++;
++            }
++        }
++
++        /**
++         * Whether an entry staged after pass {@code stagedFrame} is uploaded in the current pass. Index passes follow
++         * the vertex decision for the same key ({@code carriedVertex}); index-only entries are never budgeted.
++         */
++        public boolean uploadsNow(final int stagedFrame, final boolean urgent, final boolean vertexPass, final boolean carriedVertex) {
++            boolean forced = this.flush || urgent || this.frame - stagedFrame > this.maxDelayFrames;
++            if (forced) {
++                return true;
++            }
++
++            boolean now = vertexPass ? this.remaining > 0L : !carriedVertex;
++            if (!now && vertexPass) {
++                this.carriedEntries++;
++            }
++
++            return now;
++        }
++    }
+ }

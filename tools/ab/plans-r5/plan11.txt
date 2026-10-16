@@ -1,0 +1,9 @@
+# Step 5e: pregrow on top of the rest of the decided set (ARD = WIN without pregrow), travel 4+4 ABBA, traced
+travel r5ab-p-tr-ARD-1 AR+mc.fastAnimateTick=true,mc.fastTextureAnimation=true --bench-prop frameTrace=true
+travel r5ab-p-tr-WIN-1 WIN --bench-prop frameTrace=true
+travel r5ab-p-tr-WIN-2 WIN --bench-prop frameTrace=true
+travel r5ab-p-tr-ARD-2 AR+mc.fastAnimateTick=true,mc.fastTextureAnimation=true --bench-prop frameTrace=true
+travel r5ab-p-tr-ARD-3 AR+mc.fastAnimateTick=true,mc.fastTextureAnimation=true --bench-prop frameTrace=true
+travel r5ab-p-tr-WIN-3 WIN --bench-prop frameTrace=true
+travel r5ab-p-tr-WIN-4 WIN --bench-prop frameTrace=true
+travel r5ab-p-tr-ARD-4 AR+mc.fastAnimateTick=true,mc.fastTextureAnimation=true --bench-prop frameTrace=true

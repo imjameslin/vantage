@@ -1,0 +1,440 @@
+--- a/net/minecraft/client/multiplayer/ClientLevel.java
++++ b/net/minecraft/client/multiplayer/ClientLevel.java
+@@ -259,6 +259,9 @@
+         this.setRespawnData(LevelData.RespawnData.of(dimension, new BlockPos(8, 64, 8), 0.0F, 0.0F));
+         this.serverSimulationDistance = serverSimulationDistance;
+         this.environmentAttributes = this.addEnvironmentAttributeLayers(EnvironmentAttributeSystem.builder()).build();
++        // R5-D: planned from the same inputs, at the same moment, as the system above (tags may change later).
++        // Computed whatever FAST_ANIMATE_TICK's value: an in-session A/B may switch the fast path on later (CONTRACT 16.AB).
++        this.fastAmbientPlan = computeFastAmbientPlan(dimensionType.value());
+         this.updateSkyBrightness();
+     }
+ 
+@@ -501,6 +504,7 @@
+     }
+ 
+     public void unload(final LevelChunk levelChunk) {
++        net.minecraft.client.renderer.chunk.Lod.onChunkUnload(this, levelChunk);
+         levelChunk.clearAllBlockEntities();
+         this.chunkSource.getLightEngine().setLightEnabled(levelChunk.getPos(), false);
+         this.entityStorage.stopTicking(levelChunk.getPos());
+@@ -509,6 +513,7 @@
+     public void onChunkLoaded(final ChunkPos pos) {
+         this.tintCaches.forEach((resolver, cache) -> cache.invalidateForChunk(pos.x(), pos.z()));
+         this.entityStorage.startTicking(pos);
++        net.minecraft.client.renderer.chunk.Lod.onChunkLoaded(this, pos);
+     }
+ 
+     public void clearTintCaches() {
+@@ -560,6 +565,10 @@
+         RandomSource animateRandom = RandomSource.createThreadLocalInstance();
+         Block markerParticleTarget = this.getMarkerParticleTarget();
+         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
++        if (FAST_ANIMATE_TICK && !this.isDebug()) {
++            this.fastAnimateTick(xt, yt, zt, animateRandom, markerParticleTarget, pos); // R5-D: exact fast path (CONTRACT.md 16.R5-D)
++            return;
++        }
+ 
+         for (int i = 0; i < 667; i++) {
+             this.doAnimateTick(xt, yt, zt, 16, animateRandom, markerParticleTarget, pos);
+@@ -595,6 +604,282 @@
+         BlockState state = this.getBlockState(pos);
+         state.getBlock().animateTick(state, this, pos, animateRandom);
+         FluidState fluidState = this.getFluidState(pos);
++        if (!fluidState.isEmpty()) {
++            fluidState.animateTick(this, pos, animateRandom);
++            ParticleOptions dripParticle = fluidState.getDripParticle();
++            if (dripParticle != null && this.random.nextInt(10) == 0) {
++                boolean hasWatertightBottom = state.isFaceSturdy(this, pos, Direction.DOWN);
++                BlockPos below = pos.below();
++                this.trySpawnDripParticles(below, this.getBlockState(below), dripParticle, hasWatertightBottom);
++            }
++        }
++
++        if (markerParticleTarget == state.getBlock()) {
++            this.addParticle(new BlockParticleOption(ParticleTypes.BLOCK_MARKER, state), x + 0.5, y + 0.5, z + 0.5, 0.0, 0.0, 0.0);
++        }
++
++        if (!state.isCollisionShapeFullBlock(this, pos)) {
++            for (AmbientParticle particle : this.environmentAttributes().getValue(EnvironmentAttributes.AMBIENT_PARTICLES, pos)) {
++                if (particle.canSpawn(this.random)) {
++                    this.addParticle(
++                        particle.particle(),
++                        pos.getX() + this.random.nextDouble(),
++                        pos.getY() + this.random.nextDouble(),
++                        pos.getZ() + this.random.nextDouble(),
++                        0.0,
++                        0.0,
++                        0.0
++                    );
++                }
++            }
++        }
++    }
++
++    // =============================================================================================================
++    // R5-D: exact fast path for animateTick (-Dmc.fastAnimateTick, default on since round 5; CONTRACT.md 16.R5-D / 16.R5-FIN).
++    // Render thread only (Minecraft.tick); ClientLevel is client-only, the integrated server never runs this.
++    // Same RNG calls in the same order with the same results, same block/fluid/biome values, same particles:
++    //  (a) the AMBIENT_PARTICLES lookup is skipped when it provably yields the empty list: the attribute's layers are
++    //      [dimension constant] + [biome positional] only (no timeline/weather layer), the folded constant base is empty,
++    //      and the position's noise biome has no AMBIENT_PARTICLES entry, so the biome layer returns the base unchanged
++    //      (EnvironmentAttributeMap.applyModifier) and sanitize (AttributeRange.any) keeps it. An empty list's loop calls
++    //      neither canSpawn nor nextDouble, so skipping consumes no RNG. Plan computed in the constructor right after
++    //      the EnvironmentAttributeSystem is baked, from the same dimension type / timeline HolderSet (a later tag
++    //      update changes neither; a dimension change or registry sync builds a new ClientLevel and system); biome
++    //      answers cached per Holder identity (a Holder's Biome and its attribute map are immutable).
++    //  (b) block, fluid and biome come from one chunk lookup (5x5 grid, valid for one animateTick: no packet runs
++    //      inside it) and one section: Level.getBlockState's bounds/empty-chunk/hasOnlyAir rules, fluid =
++    //      state.getFluidState() (LevelChunkSection.getFluidState is states.get().getFluidState(); AIR/VOID_AIR give
++    //      EMPTY), biome = the same section's quart cell (no clamp inside the build height). No block's animateTick
++    //      changes blocks, so reading the fluid from the earlier state equals vanilla's later getFluidState(pos).
++    //  (c) the six position nextInt(r) calls (r = 16/32, power of two) on the level's LegacyRandomSource are one seed
++    //      read, six LCG steps and one compareAndSet instead of six CAS (identical values and final seed; a lost CAS
++    //      throws the same ThreadingDetector exception). Kill switch -Dmc.fastAnimateTick.batchRng=false.
++    // -Dmc.fastAnimateTick.verify=true re-runs the vanilla lookups/RNG per position and logs any mismatch (diagnostic).
++    // =============================================================================================================
++    // Default ON since round 5 (CONTRACT.md 16.R5-FIN); -Dmc.fastAnimateTick=false (or 0) is the off switch.
++    // Runtime-switchable since CONTRACT.md 16.AB (bench mode=abab sets it by reflection at a frame boundary): read once
++    // per animateTick call (once per client tick, render thread), and the fast path's state (5x5 chunk grid, ambient plan,
++    // batched-RNG seed field) is built whatever the start value, so either path can follow the other at any tick (both
++    // consume the level RNG identically). A volatile load per client tick: no measurable cost.
++    public static volatile boolean FAST_ANIMATE_TICK = defaultOnFlag("mc.fastAnimateTick");
++    private static boolean defaultOnFlag(final String name) {
++        String value = System.getProperty(name);
++        return value == null || !value.equalsIgnoreCase("false") && !value.equals("0");
++    }
++    // Sub-switches of the fast path (only read inside it), independent of FAST_ANIMATE_TICK's start value (16.AB).
++    static final boolean FAST_ANIMATE_TICK_BATCH_RNG = !"false".equals(System.getProperty("mc.fastAnimateTick.batchRng"));
++    static final boolean FAST_ANIMATE_TICK_VERIFY = Boolean.getBoolean("mc.fastAnimateTick.verify");
++    private static final java.lang.reflect.@Nullable Field FAST_LEGACY_SEED = FAST_ANIMATE_TICK_BATCH_RNG ? fastLegacySeedField() : null;
++    private static final long LCG_MULTIPLIER = 25214903917L;
++    private static final long LCG_INCREMENT = 11L;
++    private static final long LCG_MASK = 281474976710655L;
++    private static final int FAST_GRID = 5;
++    private final @Nullable LevelChunk[] fastChunkGrid = new LevelChunk[FAST_GRID * FAST_GRID];
++    private int fastGridFilled;
++    private int fastGridX0;
++    private int fastGridZ0;
++    private int fastMinY;
++    private int fastMaxY;
++    /** 1 = skip positions whose biome lacks AMBIENT_PARTICLES, 2 = never skip (set by the constructor). */
++    private final byte fastAmbientPlan;
++    private @Nullable Holder<Biome> fastBiomeA;
++    private @Nullable Holder<Biome> fastBiomeB;
++    private boolean fastBiomeAHas;
++    private boolean fastBiomeBHas;
++    private boolean fastSeedResolved;
++    private java.util.concurrent.atomic.@Nullable AtomicLong fastSeed;
++    private net.minecraft.world.level.levelgen.@Nullable LegacyRandomSource fastVerifyRandom;
++    private int fastVerifyMismatches;
++
++    private static java.lang.reflect.@Nullable Field fastLegacySeedField() {
++        try {
++            java.lang.reflect.Field field = net.minecraft.world.level.levelgen.LegacyRandomSource.class.getDeclaredField("seed");
++            if (field.getType() != java.util.concurrent.atomic.AtomicLong.class) {
++                return null;
++            }
++            field.setAccessible(true);
++            return field;
++        } catch (ReflectiveOperationException | RuntimeException e) {
++            LOGGER.warn("mc.fastAnimateTick: LegacyRandomSource.seed not accessible, batched RNG off", e);
++            return null;
++        }
++    }
++
++    private java.util.concurrent.atomic.@Nullable AtomicLong fastSeed() {
++        if (!this.fastSeedResolved) {
++            this.fastSeedResolved = true;
++            if (FAST_LEGACY_SEED != null && this.random.getClass() == net.minecraft.world.level.levelgen.LegacyRandomSource.class) {
++                try {
++                    this.fastSeed = (java.util.concurrent.atomic.AtomicLong)FAST_LEGACY_SEED.get(this.random);
++                } catch (ReflectiveOperationException | RuntimeException e) {
++                    this.fastSeed = null;
++                }
++            }
++        }
++        return this.fastSeed;
++    }
++
++    /** LegacyRandomSource.next's seed step. */
++    static long fastLcg(final long seed) {
++        return seed * LCG_MULTIPLIER + LCG_INCREMENT & LCG_MASK;
++    }
++
++    /** BitRandomSource.nextInt(bound) for a power-of-two bound, given the seed after next(31)'s step. */
++    static int fastNextIntPow2(final long steppedSeed, final int bound) {
++        return (int)((long)bound * (int)(steppedSeed >> 17) >> 31);
++    }
++
++    /**
++     * 1 if AMBIENT_PARTICLES' layers in a ClientLevel of this dimension type are [dimension constant] + [biome positional]
++     * only and the folded constant base is empty (so a biome without an AMBIENT_PARTICLES entry yields the empty list),
++     * else 2. Mirrors EnvironmentAttributeSystem.addDefaultLayers (static: dimension constant, biome positional;
++     * dynamic: timelines, weather) plus ClientLevel.addEnvironmentAttributeLayers (sky colour / light factor only).
++     */
++    static byte computeFastAmbientPlan(final DimensionType dimension) {
++        net.minecraft.world.attribute.EnvironmentAttribute<List<AmbientParticle>> attribute = EnvironmentAttributes.AMBIENT_PARTICLES;
++        if (attribute.isFullResolutionBiomes() || attribute.isSpatiallyInterpolated()) {
++            return 2;
++        }
++        for (Holder<net.minecraft.world.timeline.Timeline> timeline : dimension.timelines()) {
++            if (timeline.value().attributes().contains(attribute)) {
++                return 2;
++            }
++        }
++        if (net.minecraft.world.attribute.WeatherAttributes.RAIN.contains(attribute) || net.minecraft.world.attribute.WeatherAttributes.THUNDER.contains(attribute)) {
++            return 2;
++        }
++        List<AmbientParticle> base = attribute.sanitizeValue(dimension.attributes().applyModifier(attribute, attribute.defaultValue()));
++        return base.isEmpty() ? (byte)1 : (byte)2;
++    }
++
++    /**
++     * animateTick's 667 x (16, 32) loop. Not for the debug world (its LevelChunk.getBlockState is synthetic): the caller
++     * keeps the vanilla loop there. tools/AnimateTickParityTest.java calls this with its own animateRandom.
++     */
++    private void fastAnimateTick(
++        final int xt, final int yt, final int zt, final RandomSource animateRandom, final @Nullable Block markerParticleTarget,
++        final BlockPos.MutableBlockPos pos
++    ) {
++        boolean ambientSkip = this.fastAmbientPlan == 1;
++        java.util.concurrent.atomic.AtomicLong seed = FAST_ANIMATE_TICK_BATCH_RNG ? this.fastSeed() : null;
++        this.fastGridX0 = (xt - 31) >> 4;
++        this.fastGridZ0 = (zt - 31) >> 4;
++        this.fastGridFilled = 0;
++        this.fastMinY = this.getMinY();
++        this.fastMaxY = this.getMaxY();
++        try {
++            for (int i = 0; i < 667; i++) {
++                this.doAnimateTickFast(xt, yt, zt, 16, animateRandom, markerParticleTarget, pos, ambientSkip, seed);
++                this.doAnimateTickFast(xt, yt, zt, 32, animateRandom, markerParticleTarget, pos, ambientSkip, seed);
++            }
++        } finally {
++            java.util.Arrays.fill(this.fastChunkGrid, null);
++            this.fastGridFilled = 0;
++        }
++    }
++
++    /** chunkSource.getChunk(cx, cz, FULL, false) (null when absent: vanilla's empty chunk), memoized for one animateTick. */
++    private @Nullable LevelChunk fastChunk(final int chunkX, final int chunkZ) {
++        int gx = chunkX - this.fastGridX0;
++        int gz = chunkZ - this.fastGridZ0;
++        if (gx < 0 || gx >= FAST_GRID || gz < 0 || gz >= FAST_GRID) {
++            return this.chunkSource.getChunk(chunkX, chunkZ, net.minecraft.world.level.chunk.status.ChunkStatus.FULL, false);
++        }
++        int cell = gz * FAST_GRID + gx;
++        int bit = 1 << cell;
++        if ((this.fastGridFilled & bit) == 0) {
++            this.fastChunkGrid[cell] = this.chunkSource.getChunk(chunkX, chunkZ, net.minecraft.world.level.chunk.status.ChunkStatus.FULL, false);
++            this.fastGridFilled |= bit;
++        }
++        return this.fastChunkGrid[cell];
++    }
++
++    private boolean fastBiomeHasAmbient(final Holder<Biome> biome) {
++        if (biome == this.fastBiomeA) {
++            return this.fastBiomeAHas;
++        }
++        boolean has;
++        if (biome == this.fastBiomeB) {
++            has = this.fastBiomeBHas;
++        } else {
++            has = biome.value().getAttributes().contains(EnvironmentAttributes.AMBIENT_PARTICLES);
++        }
++        this.fastBiomeB = this.fastBiomeA;
++        this.fastBiomeBHas = this.fastBiomeAHas;
++        this.fastBiomeA = biome;
++        this.fastBiomeAHas = has;
++        return has;
++    }
++
++    private void doAnimateTickFast(
++        final int xt,
++        final int yt,
++        final int zt,
++        final int r,
++        final RandomSource animateRandom,
++        final @Nullable Block markerParticleTarget,
++        final BlockPos.MutableBlockPos pos,
++        final boolean ambientSkip,
++        final java.util.concurrent.atomic.@Nullable AtomicLong seed
++    ) {
++        int x;
++        int y;
++        int z;
++        if (seed != null) {
++            // LegacyRandomSource.next(31) x6 and BitRandomSource.nextInt(power of two) = (int)((long)r * next(31) >> 31).
++            long s0 = seed.get();
++            long s = fastLcg(s0);
++            int a = fastNextIntPow2(s, r);
++            s = fastLcg(s);
++            int b = fastNextIntPow2(s, r);
++            s = fastLcg(s);
++            int c = fastNextIntPow2(s, r);
++            s = fastLcg(s);
++            int d = fastNextIntPow2(s, r);
++            s = fastLcg(s);
++            int e = fastNextIntPow2(s, r);
++            s = fastLcg(s);
++            int f = fastNextIntPow2(s, r);
++            if (FAST_ANIMATE_TICK_VERIFY) {
++                this.fastVerifyRng(s0, r, a, b, c, d, e, f);
++            }
++            if (!seed.compareAndSet(s0, s)) {
++                throw net.minecraft.util.ThreadingDetector.makeThreadingException("LegacyRandomSource", null);
++            }
++            x = xt + a - b;
++            y = yt + c - d;
++            z = zt + e - f;
++        } else {
++            x = xt + this.random.nextInt(r) - this.random.nextInt(r);
++            y = yt + this.random.nextInt(r) - this.random.nextInt(r);
++            z = zt + this.random.nextInt(r) - this.random.nextInt(r);
++        }
++        pos.set(x, y, z);
++        BlockState state;
++        net.minecraft.world.level.chunk.LevelChunkSection section = null;
++        if (y >= this.fastMinY && y <= this.fastMaxY && ChunkPos.isValid(x >> 4, z >> 4)) {
++            LevelChunk chunk = this.fastChunk(x >> 4, z >> 4);
++            if (chunk == null) {
++                state = Blocks.VOID_AIR.defaultBlockState();
++            } else {
++                int sectionIndex = chunk.getSectionIndex(y);
++                net.minecraft.world.level.chunk.LevelChunkSection[] sections = chunk.getSections();
++                if (sectionIndex >= 0 && sectionIndex < sections.length) {
++                    section = sections[sectionIndex];
++                    state = section.hasOnlyAir() ? Blocks.AIR.defaultBlockState() : section.getBlockState(x & 15, y & 15, z & 15);
++                } else {
++                    state = Blocks.AIR.defaultBlockState();
++                }
++            }
++        } else {
++            state = Blocks.VOID_AIR.defaultBlockState();
++        }
++        FluidState fluidState = state.getFluidState();
++        if (FAST_ANIMATE_TICK_VERIFY) {
++            this.fastVerifyLookup(pos, state, fluidState);
++        }
++        state.getBlock().animateTick(state, this, pos, animateRandom);
+         if (!fluidState.isEmpty()) {
+             fluidState.animateTick(this, pos, animateRandom);
+             ParticleOptions dripParticle = fluidState.getDripParticle();
+@@ -610,6 +895,20 @@
+         }
+ 
+         if (!state.isCollisionShapeFullBlock(this, pos)) {
++            if (ambientSkip) {
++                Holder<Biome> biome = section != null
++                    ? section.getNoiseBiome(x >> 2 & 3, y >> 2 & 3, z >> 2 & 3)
++                    : this.getNoiseBiome(x >> 2, y >> 2, z >> 2);
++                if (FAST_ANIMATE_TICK_VERIFY) {
++                    this.fastVerifyBiome(pos, biome);
++                }
++                if (!this.fastBiomeHasAmbient(biome)) {
++                    if (FAST_ANIMATE_TICK_VERIFY && !this.environmentAttributes().getValue(EnvironmentAttributes.AMBIENT_PARTICLES, pos).isEmpty()) {
++                        this.fastVerifyFail("ambient particles skipped but not empty at " + pos.toShortString());
++                    }
++                    return;
++                }
++            }
+             for (AmbientParticle particle : this.environmentAttributes().getValue(EnvironmentAttributes.AMBIENT_PARTICLES, pos)) {
+                 if (particle.canSpawn(this.random)) {
+                     this.addParticle(
+@@ -626,6 +925,37 @@
+         }
+     }
+ 
++    private void fastVerifyRng(final long s0, final int r, final int a, final int b, final int c, final int d, final int e, final int f) {
++        net.minecraft.world.level.levelgen.LegacyRandomSource probe = this.fastVerifyRandom;
++        if (probe == null) {
++            probe = this.fastVerifyRandom = new net.minecraft.world.level.levelgen.LegacyRandomSource(0L);
++        }
++        probe.setSeed(s0 ^ LCG_MULTIPLIER); // setSeed scrambles with ^ multiplier: the raw seed becomes s0
++        if (probe.nextInt(r) != a || probe.nextInt(r) != b || probe.nextInt(r) != c || probe.nextInt(r) != d || probe.nextInt(r) != e
++            || probe.nextInt(r) != f) {
++            this.fastVerifyFail("batched RNG differs from LegacyRandomSource.nextInt(" + r + ")");
++        }
++    }
++
++    private void fastVerifyLookup(final BlockPos pos, final BlockState state, final FluidState fluidState) {
++        if (this.getBlockState(pos) != state || this.getFluidState(pos) != fluidState) {
++            this.fastVerifyFail("block/fluid differs at " + pos.toShortString() + ": " + state + " vs " + this.getBlockState(pos));
++        }
++    }
++
++    private void fastVerifyBiome(final BlockPos pos, final Holder<Biome> biome) {
++        Holder<Biome> expected = this.getBiomeManager().getNoiseBiomeAtPosition(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
++        if (expected != biome) {
++            this.fastVerifyFail("biome differs at " + pos.toShortString() + ": " + biome + " vs " + expected);
++        }
++    }
++
++    private void fastVerifyFail(final String message) {
++        if (this.fastVerifyMismatches++ < 20) {
++            LOGGER.error("mc.fastAnimateTick.verify: {}", message);
++        }
++    }
++
+     private void trySpawnDripParticles(final BlockPos pos, final BlockState state, final ParticleOptions dripParticle, final boolean isTopSolid) {
+         if (state.getFluidState().isEmpty()) {
+             VoxelShape collisionShape = state.getCollisionShape(this, pos);
+@@ -842,6 +1172,28 @@
+ 
+     @Override
+     public void sendBlockUpdated(final BlockPos pos, final BlockState old, final BlockState current, final @Block.UpdateFlags int updateFlags) {
++        // Stage-2 W11 (BlockUpdateFilter, CONTRACT 16.S2-W11): a render-equivalent update cannot change any mesh; skip its rebuild.
++        boolean filter = net.minecraft.client.renderer.chunk.BlockUpdateFilter.enabled;
++        if (filter || net.minecraft.client.renderer.chunk.ChunkStats.ENABLED) {
++            boolean sameRender = net.minecraft.client.renderer.chunk.BlockUpdateFilter.renderEquivalent(
++                this.minecraft.getModelManager(), this, pos, old, current
++            );
++            if (net.minecraft.client.renderer.chunk.ChunkStats.ENABLED) {
++                net.minecraft.client.renderer.chunk.ChunkStats.blockUpdate(old, current, sameRender);
++                if (sameRender && !filter && net.minecraft.client.renderer.chunk.BlockUpdateFilter.VERIFY) {
++                    net.minecraft.client.renderer.chunk.ChunkStats.source = net.minecraft.client.renderer.chunk.ChunkStats.SRC_SAME_RENDER;
++                    this.levelExtractor.blockChanged(pos, updateFlags);
++                    net.minecraft.client.renderer.chunk.ChunkStats.source = net.minecraft.client.renderer.chunk.ChunkStats.SRC_OTHER;
++                    return;
++                }
++            }
++
++            if (sameRender && filter) {
++                return;
++            }
++        }
++
++        net.minecraft.client.renderer.chunk.Lod.onBlockChanged(this, pos);
+         this.levelExtractor.blockChanged(pos, updateFlags);
+     }
+ 
+@@ -851,13 +1203,29 @@
+     }
+ 
+     public void setSectionDirtyWithNeighbors(final int chunkX, final int chunkY, final int chunkZ) {
++        // Stage-2 W0b (ChunkStats, off by default): the only vanilla caller is readSectionList (light update packets).
++        if (net.minecraft.client.renderer.chunk.ChunkStats.ENABLED) {
++            net.minecraft.client.renderer.chunk.ChunkStats.source = net.minecraft.client.renderer.chunk.ChunkStats.SRC_LIGHT_PACKET;
++        }
++
+         this.levelExtractor.setSectionDirtyWithNeighbors(chunkX, chunkY, chunkZ);
++        if (net.minecraft.client.renderer.chunk.ChunkStats.ENABLED) {
++            net.minecraft.client.renderer.chunk.ChunkStats.source = net.minecraft.client.renderer.chunk.ChunkStats.SRC_OTHER;
++        }
+     }
+ 
+     public void setSectionRangeDirty(
+         final int minSectionX, final int minSectionY, final int minSectionZ, final int maxSectionX, final int maxSectionY, final int maxSectionZ
+     ) {
++        // Stage-2 W0b: the only vanilla caller is ClientPacketListener.enableChunkLight (a chunk's light came on).
++        if (net.minecraft.client.renderer.chunk.ChunkStats.ENABLED) {
++            net.minecraft.client.renderer.chunk.ChunkStats.source = net.minecraft.client.renderer.chunk.ChunkStats.SRC_CHUNK_LOAD;
++        }
++
+         this.levelExtractor.setSectionRangeDirty(minSectionX, minSectionY, minSectionZ, maxSectionX, maxSectionY, maxSectionZ);
++        if (net.minecraft.client.renderer.chunk.ChunkStats.ENABLED) {
++            net.minecraft.client.renderer.chunk.ChunkStats.source = net.minecraft.client.renderer.chunk.ChunkStats.SRC_OTHER;
++        }
+     }
+ 
+     @Override

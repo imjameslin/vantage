@@ -1,0 +1,73 @@
+--- a/net/minecraft/client/gui/screens/LoadingOverlay.java
++++ b/net/minecraft/client/gui/screens/LoadingOverlay.java
+@@ -1,3 +1,14 @@
++// Patched copy of the vanilla 26.3 class (stage-2 W7, instant UI transitions; docs/metal/CONTRACT.md 16.W7). Differences
++// from vanilla, all behind UiTransitions.instant (-Dmc.ui.instantTransitions, default on; off = vanilla, read once per overlay):
++//  - tick(): once the completion callback has run (same moment as vanilla) and the screen below was re-initialized (same
++//    call), the overlay removes itself (only if it is still the current overlay) instead of fading out for 2.0 s; in a world
++//    (the callback discarded all compiled terrain) it first stays opaque until UiTransitions.terrainShown has held for
++//    IN_WORLD_STABLE_TICKS ticks, at most IN_WORLD_HOLD_CAP_MS (vanilla's fade-out) after the callback;
++//  - isReadyToFadeOut(): no 1.0 s minimum hold on later reloads (fadeIn), EXCEPT while a server / world resource-pack reload
++//    is pending (DownloadedPackSource.serverPackReloadPending()): its callback sends ServerboundResourcePackPacket, whose
++//    timing stays vanilla's;
++//  - extractRenderState(): the 0.5 s fade-in animation is skipped (opaque at once, as vanilla is after 0.5 s), and the
++//    in-world hold draws the opaque first stage of vanilla's fade-out (fadeOutAnim pinned to 0).
+ package net.minecraft.client.gui.screens;
+ 
+ import com.mojang.blaze3d.platform.NativeImage;
+@@ -45,6 +56,11 @@
+     private float currentProgress;
+     private long fadeOutStart = -1L;
+     private long fadeInStart = -1L;
++    /** W7: UiTransitions.instant when this overlay was created. */
++    private final boolean instant = UiTransitions.instant;
++    /** W7: in-world hold after the callback (-1 = none), and consecutive ticks UiTransitions.terrainShown held. */
++    private long terrainHoldStart = -1L;
++    private int terrainShownTicks;
+ 
+     public LoadingOverlay(final Minecraft minecraft, final ReloadInstance reload, final Consumer<Optional<Throwable>> onFinish, final boolean fadeIn) {
+         this.minecraft = minecraft;
+@@ -70,8 +86,8 @@
+             this.fadeInStart = now;
+         }
+ 
+-        float fadeOutAnim = this.fadeOutStart > -1L ? (float)(now - this.fadeOutStart) / 1000.0F : -1.0F;
+-        float fadeInAnim = this.fadeInStart > -1L ? (float)(now - this.fadeInStart) / 500.0F : -1.0F;
++        float fadeOutAnim = this.fadeOutStart > -1L ? (this.instant ? 0.0F : (float)(now - this.fadeOutStart) / 1000.0F) : -1.0F;
++        float fadeInAnim = this.fadeInStart > -1L ? (this.instant ? 1.0F : (float)(now - this.fadeInStart) / 500.0F) : -1.0F;
+         float logoAlpha;
+         if (fadeOutAnim >= 1.0F) {
+             if (this.minecraft.gui.screen() != null) {
+@@ -166,10 +182,32 @@
+                 Window window = this.minecraft.getWindow();
+                 this.minecraft.gui.screen().init(window.getGuiScaledWidth(), window.getGuiScaledHeight());
+             }
++
++            // W7: no fade-out. The callback may have replaced this overlay (a deferred reload) or removed it (a re-entrant tick
++            // from Minecraft.doWorldLoad's wait loop), so only remove it while it is still the current one. In a world the
++            // callback discarded the compiled terrain (LevelExtractor.allChanged): stay opaque until it is back.
++            if (this.instant && this.minecraft.gui.overlay() == this) {
++                if (this.minecraft.level != null) {
++                    this.terrainHoldStart = Util.getMillis();
++                } else {
++                    this.minecraft.gui.setOverlay(null);
++                }
++            }
++        } else if (this.terrainHoldStart > -1L && this.minecraft.gui.overlay() == this) {
++            this.terrainShownTicks = UiTransitions.terrainShown.test(this.minecraft) ? this.terrainShownTicks + 1 : 0;
++            if (this.terrainShownTicks >= UiTransitions.IN_WORLD_STABLE_TICKS
++                || this.minecraft.level == null
++                || Util.getMillis() - this.terrainHoldStart >= UiTransitions.IN_WORLD_HOLD_CAP_MS) {
++                this.minecraft.gui.setOverlay(null);
++            }
+         }
+     }
+ 
+     private boolean isReadyToFadeOut() {
++        if (this.instant && !this.minecraft.getDownloadedPackSource().serverPackReloadPending()) {
++            return true;
++        }
++
+         return !this.fadeIn || this.fadeInStart > -1L && Util.getMillis() - this.fadeInStart >= 1000L;
+     }
+ 

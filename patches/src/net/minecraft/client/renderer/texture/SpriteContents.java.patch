@@ -1,0 +1,67 @@
+--- a/net/minecraft/client/renderer/texture/SpriteContents.java
++++ b/net/minecraft/client/renderer/texture/SpriteContents.java
+@@ -386,6 +386,64 @@
+                 renderPass.setUniform("NextSprite", (GpuTextureView)this.frameTexturesByIndex.get(newFrame), sampler);
+             } else if (this.isDirty) {
+                 renderPass.setPipeline(RenderSystem.getCompiledPipeline(RenderPipelines.ANIMATE_SPRITE_BLIT));
++                renderPass.setUniform("Sprite", (GpuTextureView)this.frameTexturesByIndex.get(oldFrame), sampler);
++            }
++
++            renderPass.setUniform("SpriteAnimationInfo", ubo);
++            renderPass.draw(6, 1, frameProgressAsInt << 3, 0);
++        }
++
++        /** R7-2 (TextureAtlas.animateCompute): the texture fastDrawToAtlas binds as Sprite / CurrentSprite. */
++        public GpuTexture computeCurrentTexture() {
++            return this.frameTexturesByIndex.get(this.animationInfo.frames.get(this.frame).index).texture();
++        }
++
++        /** R7-2: the texture fastDrawToAtlas binds as NextSprite (interpolated sprites). */
++        public GpuTexture computeNextTexture() {
++            List<SpriteContents.FrameInfo> frames = this.animationInfo.frames;
++            return this.frameTexturesByIndex.get(frames.get((this.frame + 1) % frames.size()).index).texture();
++        }
++
++        /** R7-2: fastDrawToAtlas's frameProgressAsInt (its draw's first vertex >> 3, the shader's progress numerator). */
++        public int computeProgressAsInt() {
++            float frameProgress = (float)this.subFrame / this.animationInfo.frames.get(this.frame).time;
++            return (int)(frameProgress * 1000.0F);
++        }
++
++        /** R7-2: every frame texture of this animation. */
++        public java.util.Collection<GpuTexture> computeFrameTextures() {
++            List<GpuTexture> list = new java.util.ArrayList<>();
++            for (GpuTextureView view : this.frameTexturesByIndex.values()) {
++                list.add(view.texture());
++            }
++            return list;
++        }
++
++        /** R7-2: mip levels of the frame textures (the levels fastDrawToAtlas can sample exactly). */
++        public int computeFrameMipLevels() {
++            return SpriteContents.this.byMipLevel.length;
++        }
++
++        /** R5-D (mc.fastTextureAnimation): drawToAtlas uses ANIMATE_SPRITE_INTERPOLATE iff this is true, else ANIMATE_SPRITE_BLIT. */
++        public boolean fastInterpolates() {
++            return this.animationInfo.interpolateFrames;
++        }
++
++        /**
++         * R5-D (mc.fastTextureAnimation): {@link #drawToAtlas} without its per-draw setPipeline; the caller has bound
++         * {@link #fastInterpolates()}'s pipeline and passes the sampler drawToAtlas would look up. Only for needsToDraw().
++         * Same uniforms, same draw.
++         */
++        public void fastDrawToAtlas(final RenderPass renderPass, final GpuBufferSlice ubo, final GpuSampler sampler) {
++            List<SpriteContents.FrameInfo> frames = this.animationInfo.frames;
++            int oldFrame = frames.get(this.frame).index;
++            float frameProgress = (float)this.subFrame / this.animationInfo.frames.get(this.frame).time;
++            int frameProgressAsInt = (int)(frameProgress * 1000.0F);
++            if (this.animationInfo.interpolateFrames) {
++                int newFrame = frames.get((this.frame + 1) % frames.size()).index;
++                renderPass.setUniform("CurrentSprite", (GpuTextureView)this.frameTexturesByIndex.get(oldFrame), sampler);
++                renderPass.setUniform("NextSprite", (GpuTextureView)this.frameTexturesByIndex.get(newFrame), sampler);
++            } else {
+                 renderPass.setUniform("Sprite", (GpuTextureView)this.frameTexturesByIndex.get(oldFrame), sampler);
+             }
+ 

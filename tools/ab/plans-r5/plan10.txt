@@ -1,0 +1,9 @@
+# Step 5d: asyncEntityTextures on top of the decided set (WINA = WIN + asyncEntityTextures), travel 4+4 ABBA, traced
+travel r5ab-a-tr-WIN-1 WIN --bench-prop frameTrace=true
+travel r5ab-a-tr-WINA-1 WIN+mc.asyncEntityTextures=true --bench-prop frameTrace=true
+travel r5ab-a-tr-WINA-2 WIN+mc.asyncEntityTextures=true --bench-prop frameTrace=true
+travel r5ab-a-tr-WIN-2 WIN --bench-prop frameTrace=true
+travel r5ab-a-tr-WIN-3 WIN --bench-prop frameTrace=true
+travel r5ab-a-tr-WINA-3 WIN+mc.asyncEntityTextures=true --bench-prop frameTrace=true
+travel r5ab-a-tr-WINA-4 WIN+mc.asyncEntityTextures=true --bench-prop frameTrace=true
+travel r5ab-a-tr-WIN-4 WIN --bench-prop frameTrace=true

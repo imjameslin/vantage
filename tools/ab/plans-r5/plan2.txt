@@ -1,0 +1,16 @@
+# Step 2: static RD 12, 5 arms x 3 rounds, arm order reversed every round
+static r5ab-st-off-1 off
+static r5ab-st-A-1 A
+static r5ab-st-C-1 C
+static r5ab-st-AC-1 AC
+static r5ab-st-ACD-1 ACD
+static r5ab-st-ACD-2 ACD
+static r5ab-st-AC-2 AC
+static r5ab-st-C-2 C
+static r5ab-st-A-2 A
+static r5ab-st-off-2 off
+static r5ab-st-off-3 off
+static r5ab-st-A-3 A
+static r5ab-st-C-3 C
+static r5ab-st-AC-3 AC
+static r5ab-st-ACD-3 ACD

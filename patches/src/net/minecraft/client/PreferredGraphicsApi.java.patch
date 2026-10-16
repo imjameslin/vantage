@@ -1,0 +1,42 @@
+--- a/net/minecraft/client/PreferredGraphicsApi.java
++++ b/net/minecraft/client/PreferredGraphicsApi.java
+@@ -1,16 +1,27 @@
+ package net.minecraft.client;
+ 
+ import com.mojang.renderpearl.api.device.GpuBackend;
++import com.mojang.renderpearl.backend.metal.MetalBackend;
+ import com.mojang.renderpearl.backend.opengl.GlBackend;
+ import com.mojang.renderpearl.backend.vulkan.VulkanBackend;
+ import com.mojang.serialization.Codec;
+ import net.minecraft.network.chat.Component;
+ import net.minecraft.util.StringRepresentable;
++import net.minecraft.util.Util;
+ 
++/**
++ * Patched copy of the vanilla 26.3 enum (OWNER: I5). Adds {@link #METAL} ("metal", lang key
++ * {@code options.graphicsApi.metal} = "Metal", merged into en_us.json by tools/build-client.sh from
++ * client/lang/en_us.json). On macOS both DEFAULT and METAL try [Metal, Vulkan, OpenGL]; every other
++ * OS keeps the vanilla order (METAL behaves like DEFAULT there). {@code --graphicsBackend metal} works
++ * through joptsimple's case-insensitive EnumConverter, {@code preferredGraphicsBackend:"metal"} through
++ * {@link #CODEC}.
++ */
+ public enum PreferredGraphicsApi implements StringRepresentable {
+     DEFAULT("default", "options.graphicsApi.default"),
+     OPENGL("opengl", "options.graphicsApi.opengl"),
+-    VULKAN("vulkan", "options.graphicsApi.vulkan");
++    VULKAN("vulkan", "options.graphicsApi.vulkan"),
++    METAL("metal", "options.graphicsApi.metal");
+ 
+     public static final Codec<PreferredGraphicsApi> CODEC = StringRepresentable.fromEnum(PreferredGraphicsApi::values);
+     private final String serializedName;
+@@ -33,6 +44,10 @@
+     public GpuBackend[] getBackendsToTry() {
+         GlBackend gl = new GlBackend();
+         VulkanBackend vulkan = new VulkanBackend();
++        if ((this == DEFAULT || this == METAL) && Util.getPlatform() == Util.OS.OSX) {
++            return new GpuBackend[]{new MetalBackend(), vulkan, gl};
++        }
++
+         return this == VULKAN ? new GpuBackend[]{vulkan, gl} : new GpuBackend[]{gl, vulkan};
+     }
+ }

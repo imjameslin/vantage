@@ -1,0 +1,5 @@
+# Round 11 screening (build/client-r11a.jar): per-vertex fog (vfog) and half varyings (hvary), heavy preset (yaw 142.5) and median view (232.5).
+abab s1-vfog-heavy build/client-r11a.jar --jvm=-Dmcmetal.terrainVariant=vfog --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.TerrainShaderVariants#useVariant=false|true --bench-prop abab.preset=heavy
+abab s1-vfoghv-heavy build/client-r11a.jar --jvm=-Dmcmetal.terrainVariant=vfog,hvary --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.TerrainShaderVariants#useVariant=false|true --bench-prop abab.preset=heavy
+abab s1-vfog-y232 build/client-r11a.jar --jvm=-Dmcmetal.terrainVariant=vfog --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.TerrainShaderVariants#useVariant=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab s1-vfoghv-y232 build/client-r11a.jar --jvm=-Dmcmetal.terrainVariant=vfog,hvary --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.TerrainShaderVariants#useVariant=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5

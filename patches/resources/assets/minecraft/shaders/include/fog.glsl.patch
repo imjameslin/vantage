@@ -1,0 +1,25 @@
+--- a/assets/minecraft/shaders/include/fog.glsl
++++ b/assets/minecraft/shaders/include/fog.glsl
+@@ -9,6 +9,11 @@
+     float FogRenderDistanceEnd;
+     float FogSkyEnd;
+     float FogCloudsEnd;
++    // Stage 3 LOD fog (CONTRACT 16.S3-LOD-FOG, chunk/Lod#fog): terrain beyond FogLodStart (the real render distance) uses
++    // the compressed distance d - max(d - FogLodStart, 0) * FogLodCompress for the environmental fog, so the far LOD keeps
++    // a light haze while everything nearer is vanilla. Both 0 (and the empty fog's huge start) = vanilla.
++    float FogLodStart;
++    float FogLodCompress;
+ };
+ 
+ float linear_fog_value(float vertexDistance, float fogStart, float fogEnd) {
+@@ -30,6 +35,10 @@
+     return vec4(mix(inColor.rgb, fogColor.rgb, fogValue * fogColor.a), inColor.a);
+ }
+ 
++float fog_lod_distance(float sphericalDistance) {
++    return sphericalDistance - max(sphericalDistance - FogLodStart, 0.0) * FogLodCompress;
++}
++
+ float fog_spherical_distance(vec3 pos) {
+     return length(pos);
+ }

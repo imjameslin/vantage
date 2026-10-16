@@ -1,0 +1,361 @@
+--- a/net/minecraft/client/renderer/GameRenderer.java
++++ b/net/minecraft/client/renderer/GameRenderer.java
+@@ -1,3 +1,11 @@
++// Patched copy of the vanilla 26.3 class (stage-2 terrain, docs/stage2/TERRAIN-PLAN.md S1/S2/S7). Differences from
++// vanilla:
++//  - render(): tells the Metal backend the UseRgss value written into the Globals UBO (TerrainShaderVariants).
++//  - constructor: installs TerrainShaderVariants' resource-pack check (metalTerrainShadersVanilla).
++//  - extract() / levelLightmap(): round 6 item 1 lightmap ping-pong (Lightmap.notePendingUpdate /
++//    getTextureViewForThisFrame; docs/metal/CONTRACT.md 16.R6-1).
++//  - renderLevel(): hands the frame's final projection matrix (with hurt tilt, view bob and nausea, exactly as
++//    uploaded) to LevelRenderer.setFrameProjection() right after uploading it.
+ package net.minecraft.client.renderer;
+ 
+ import com.mojang.blaze3d.ProjectionType;
+@@ -108,7 +116,15 @@
+     private final ScreenEffectRenderer screenEffectRenderer;
+     private final DebugCrosshairRenderer debugCrosshairRenderer;
+     private final RenderBuffers renderBuffers;
+-    private final RenderTarget mainRenderTarget;
++    /** The target the current phase draws into: {@link #nativeTarget}, or {@link #worldTarget} during a scaled world phase. */
++    private RenderTarget mainRenderTarget;
++    /** The window-sized frame (GUI, presentation). */
++    private final RenderTarget nativeTarget;
++    /** Render scale (Options.renderScale below 100): the world is drawn into this smaller target and scaled up before the GUI. */
++    private @Nullable RenderTarget worldTarget;
++    /** The size the level's targets (LevelRenderer, hud depth) were last sized for. */
++    private int levelWidth = -1;
++    private int levelHeight = -1;
+     private final RenderTarget hud3DTarget;
+     private float bossOverlayWorldDarkening;
+     private float bossOverlayWorldDarkeningO;
+@@ -133,12 +149,58 @@
+     private final Lighting lighting = new Lighting();
+     private final GlobalSettingsUniform globalSettingsUniform = new GlobalSettingsUniform();
+     private final ProjectionMatrixBuffer levelProjectionMatrixBuffer = new ProjectionMatrixBuffer("level");
++    private final ProjectionMatrixBuffer tesseraExactProjectionBuffer = new ProjectionMatrixBuffer("level, unjittered");
+     private final ProjectionMatrixBuffer hud3dProjectionMatrixBuffer = new ProjectionMatrixBuffer("3d hud");
+     private final List<Identifier> requestedPostEffects = new ArrayList<>();
+     private final List<PostChain> appliedPostEffects = new ArrayList<>();
+     private final List<Identifier> failedPostEffects = new ArrayList<>();
+     private volatile boolean shouldResetFailedPostEffects;
++
++    private static final java.util.regex.Pattern METAL_SHADER_INCLUDE = java.util.regex.Pattern.compile("#\\s*(?:include|moj_import)\\s*([<\"])([^>\"]*)[>\"]");
++
++    /**
++     * TerrainShaderVariants gate: true iff core/terrain.fsh, core/terrain.vsh and every include they pull in
++     * (transitively) are served by the built-in "vanilla" pack, i.e. no resource pack overrides a terrain shader. Called
++     * on compile workers inside the reload that compiles the terrain pipelines (the manager already holds that reload's
++     * packs). Anything unexpected (missing file, quoted or unparsable include, read error) counts as overridden.
++     */
++    public static boolean metalTerrainShadersVanilla(final ResourceManager manager) {
++        java.util.ArrayDeque<Identifier> todo = new java.util.ArrayDeque<>();
++        Set<Identifier> seen = new HashSet<>();
++        todo.add(Identifier.withDefaultNamespace("shaders/core/terrain.fsh"));
++        todo.add(Identifier.withDefaultNamespace("shaders/core/terrain.vsh"));
++        while (!todo.isEmpty()) {
++            Identifier id = todo.poll();
++            if (!seen.add(id)) {
++                continue;
++            }
++
++            Optional<net.minecraft.server.packs.resources.Resource> resource = manager.getResource(id);
++            if (resource.isEmpty() || !net.minecraft.server.packs.repository.BuiltInPackSource.VANILLA_ID.equals(resource.get().sourcePackId())) {
++                return false;
++            }
++
++            String text;
++            try {
++                text = resource.get().readAllAsString();
++            } catch (IOException e) {
++                return false;
++            }
++
++            java.util.regex.Matcher m = METAL_SHADER_INCLUDE.matcher(text);
++            while (m.find()) {
++                Identifier include = m.group(1).equals("<") ? Identifier.tryParse(m.group(2)) : null;
++                if (include == null) {
++                    return false;
++                }
+ 
++                todo.add(include.withPrefix("shaders/include/"));
++            }
++        }
++
++        return true;
++    }
++
+     public GameRenderer(
+         final Minecraft minecraft,
+         final FirstPersonHandsAndItemsRenderer firstPersonHandsAndItemsRenderer,
+@@ -146,6 +208,8 @@
+         final ItemModelResolver itemModelResolver
+     ) {
+         this.minecraft = minecraft;
++        // Metal backend: terrain shader specialization only while the terrain shader sources are vanilla's.
++        com.mojang.renderpearl.backend.metal.TerrainShaderVariants.setVanillaSourceCheck(() -> metalTerrainShadersVanilla(minecraft.getResourceManager()));
+         this.firstPersonHandsAndItemsRenderer = firstPersonHandsAndItemsRenderer;
+         this.lightmapRenderStateExtractor = new LightmapRenderStateExtractor(this, minecraft);
+ 
+@@ -175,7 +239,8 @@
+         );
+         this.screenEffectRenderer = new ScreenEffectRenderer(this, atlasManager);
+         this.debugCrosshairRenderer = new DebugCrosshairRenderer();
+-        this.mainRenderTarget = new MainTarget(minecraft.getWindow().getWidth(), minecraft.getWindow().getHeight());
++        this.nativeTarget = new MainTarget(minecraft.getWindow().getWidth(), minecraft.getWindow().getHeight());
++        this.mainRenderTarget = this.nativeTarget;
+         this.hud3DTarget = new TextureTarget("hud_3d_depth", minecraft.getWindow().getWidth(), minecraft.getWindow().getHeight(), null, GpuFormat.D32_FLOAT);
+     }
+ 
+@@ -189,11 +254,15 @@
+         this.resourcePool.close();
+         this.guiRenderer.close();
+         this.levelProjectionMatrixBuffer.close();
++        this.tesseraExactProjectionBuffer.close();
+         this.hud3dProjectionMatrixBuffer.close();
+         this.lighting.close();
+         this.fogRenderer.close();
+         this.featureRenderDispatcher.close();
+-        this.mainRenderTarget.destroyBuffers();
++        this.nativeTarget.destroyBuffers();
++        if (this.worldTarget != null) {
++            this.worldTarget.destroyBuffers();
++        }
+         this.hud3DTarget.destroyBuffers();
+         this.renderBuffers.close();
+     }
+@@ -331,9 +400,39 @@
+ 
+     public void resize(final int width, final int height) {
+         this.resourcePool.clear();
+-        this.mainRenderTarget.resize(width, height);
++        this.nativeTarget.resize(width, height);
++        this.resizeLevel(width, height);
++    }
++
++    private void resizeLevel(final int width, final int height) {
++        this.levelWidth = width;
++        this.levelHeight = height;
+         this.hud3DTarget.resize(width, height);
+         this.minecraft.levelRenderer.resize(width, height);
++    }
++
++    /** Render scale: the world target for this frame (null at 100 %), with the level's targets sized to match. */
++    private @Nullable RenderTarget prepareWorldTarget(final int width, final int height) {
++        int percent = Math.max(50, Math.min(100, this.minecraft.options.renderScalePercent()));
++        int w = percent >= 100 ? width : Math.max(2, (width * percent / 100 + 1) & ~1);
++        int h = percent >= 100 ? height : Math.max(2, (height * percent / 100 + 1) & ~1);
++        if (w != this.levelWidth || h != this.levelHeight) {
++            this.resourcePool.clear();
++            this.resizeLevel(w, h);
++        }
++        if (percent >= 100) {
++            if (this.worldTarget != null) {
++                this.worldTarget.destroyBuffers();
++                this.worldTarget = null;
++            }
++            return null;
++        }
++        if (this.worldTarget == null) {
++            this.worldTarget = new MainTarget(w, h);
++        } else if (this.worldTarget.width != w || this.worldTarget.height != h) {
++            this.worldTarget.resize(w, h);
++        }
++        return this.worldTarget;
+     }
+ 
+     private void bobHurt(final CameraRenderState cameraState, final PoseStack poseStack) {
+@@ -358,10 +457,17 @@
+         }
+     }
+ 
++    private static final boolean FORCE_BOB = Boolean.getBoolean("mc.diag.forceBob");
++
+     private void bobView(final CameraRenderState cameraState, final PoseStack poseStack) {
+         if (cameraState.entityRenderState.isPlayer) {
+             float backwardsInterpolatedWalkDistance = cameraState.entityRenderState.backwardsInterpolatedWalkDistance;
+             float bob = cameraState.entityRenderState.bob;
++            if (FORCE_BOB) {
++                // diagnostic (mc.diag.forceBob): a walking bob while standing or flying, for recorded tests
++                backwardsInterpolatedWalkDistance = -(float)(System.nanoTime() % 100_000_000_000L * 1.0E-9 * 4.3);
++                bob = 0.1F;
++            }
+             poseStack.translate(
+                 Mth.sin(backwardsInterpolatedWalkDistance * 3.1415927F) * bob * 0.5F,
+                 -Math.abs(Mth.cos(backwardsInterpolatedWalkDistance * 3.1415927F) * bob),
+@@ -408,8 +514,14 @@
+                             () -> "Item in hand", this.mainRenderTarget.getColorTextureView(), Optional.empty(), depthTextureView, OptionalDouble.empty()
+                         );
+                 ) {
+-                    RenderSystem.bindDefaultUniforms(renderPass);
+-                    FeatureRenderDispatcher.renderAllFeatures(renderPass, frame);
++                    // Stage 4 (Tessera): the hand is posed in world orientation near the camera: lit like the entities
++                    Tessera.INSTANCE.levelFrame = Tessera.active;
++                    try {
++                        RenderSystem.bindDefaultUniforms(renderPass);
++                        FeatureRenderDispatcher.renderAllFeatures(renderPass, frame);
++                    } finally {
++                        Tessera.INSTANCE.levelFrame = false;
++                    }
+                 }
+ 
+                 modelViewStack.popMatrix();
+@@ -447,6 +559,7 @@
+         this.extractOptions();
+         if (this.gameRenderState.shouldRenderLevel) {
+             this.lightmapRenderStateExtractor.extract(this.gameRenderState.lightmapRenderState, 1.0F);
++            this.lightmap.notePendingUpdate(this.gameRenderState.lightmapRenderState.needsUpdate);
+             this.extractCamera(deltaTracker, worldPartialTicks);
+             this.minecraft.levelExtractor.extract(deltaTracker, this.mainCamera, worldPartialTicks);
+         } else {
+@@ -469,6 +582,9 @@
+     public void render() {
+         ProfilerFiller profiler = Profiler.get();
+         profiler.push("render");
++        if (Tessera.ENABLED) {
++            Tessera.INSTANCE.ensureResources();
++        }
+         WindowRenderState windowRenderState = this.gameRenderState.windowRenderState;
+         if (windowRenderState.width != this.mainRenderTarget.width || windowRenderState.height != this.mainRenderTarget.height) {
+             this.resize(windowRenderState.width, windowRenderState.height);
+@@ -479,25 +595,48 @@
+             .clearColorAndDepthTextures(
+                 this.mainRenderTarget.getColorTexture(), this.gameRenderState.guiRenderState.clearColorOverride, this.mainRenderTarget.getDepthTexture(), 0.0
+             );
++        RenderTarget world = this.gameRenderState.shouldRenderLevel ? this.prepareWorldTarget(windowRenderState.width, windowRenderState.height) : null;
++        if (world != null) {
++            RenderSystem.getDevice()
++                .createCommandEncoder()
++                .clearColorAndDepthTextures(world.getColorTexture(), this.gameRenderState.guiRenderState.clearColorOverride, world.getDepthTexture(), 0.0);
++        }
++        boolean useRgss = this.gameRenderState.optionsRenderState.textureFiltering == TextureFilteringMethod.RGSS;
++        // Metal backend: terrain fragment shaders are specialized on UseRgss; pick the variant equal to the uniform.
++        com.mojang.renderpearl.backend.metal.TerrainShaderVariants.setFrameUsesRgss(useRgss);
++        // CONTRACT.md 16.R8-2: the nearest-path variant assumes the terrain sampler's anisotropy 1 (LevelRenderer).
++        com.mojang.renderpearl.backend.metal.TerrainShaderVariants.setFrameAnisotropic(
++            this.gameRenderState.optionsRenderState.textureFiltering == TextureFilteringMethod.ANISOTROPIC
++        );
+         this.globalSettingsUniform
+             .update(
+-                windowRenderState.width,
+-                windowRenderState.height,
++                world != null ? world.width : windowRenderState.width,
++                world != null ? world.height : windowRenderState.height,
+                 this.gameRenderState.optionsRenderState.glintStrength,
+                 this.gameRenderState.shouldRenderLevel ? this.gameRenderState.levelRenderState.gameTime : 0L,
+                 this.gameRenderState.shouldRenderLevel ? this.gameRenderState.levelRenderState.worldPartialTicks : 0.0F,
+                 this.gameRenderState.optionsRenderState.menuBackgroundBlurriness,
+                 this.gameRenderState.levelRenderState.cameraRenderState.pos,
+-                this.gameRenderState.optionsRenderState.textureFiltering == TextureFilteringMethod.RGSS
++                useRgss
+             );
+         if (this.gameRenderState.shouldRenderLevel) {
+             this.preparePostEffects(this.gameRenderState.requestedPostEffects);
+             this.lightmap.render(this.gameRenderState.lightmapRenderState);
+             profiler.push("world");
+-            this.renderLevel();
+-            this.tryTakeScreenshotIfNeeded();
+-            this.minecraft.levelRenderer.blitEntityOutline();
+-            this.applyPostEffects();
++            if (world != null) {
++                this.mainRenderTarget = world;
++            }
++            try {
++                this.renderLevel();
++                this.tryTakeScreenshotIfNeeded();
++                this.minecraft.levelRenderer.blitEntityOutline();
++                this.applyPostEffects();
++            } finally {
++                this.mainRenderTarget = this.nativeTarget;
++            }
++            if (world != null) {
++                this.scaleUpWorld(world, windowRenderState, useRgss);
++            }
+             profiler.pop();
+         } else {
+             this.preparePostEffects(Collections.emptyList());
+@@ -546,6 +685,27 @@
+         for (PostChain postEffect : previousPostEffects) {
+             postEffect.closePersistentTargets();
+         }
++    }
++
++    /** Render scale: the finished world image onto the window-sized frame (bilinear), and the GUI's screen size back. */
++    private void scaleUpWorld(final RenderTarget world, final WindowRenderState windowRenderState, final boolean useRgss) {
++        try (RenderPass pass = RenderSystem.getDevice().createCommandEncoder().createRenderPass(
++                () -> "Render scale up", this.nativeTarget.getColorTextureView(), Optional.empty())) {
++            pass.setPipeline(RenderSystem.getCompiledPipeline(RenderPipelines.RENDER_SCALE_UP));
++            pass.setUniform("InSampler", world.getColorTextureView(), RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR));
++            pass.draw(3, 1, 0, 0);
++        }
++        this.globalSettingsUniform
++            .update(
++                windowRenderState.width,
++                windowRenderState.height,
++                this.gameRenderState.optionsRenderState.glintStrength,
++                this.gameRenderState.levelRenderState.gameTime,
++                this.gameRenderState.levelRenderState.worldPartialTicks,
++                this.gameRenderState.optionsRenderState.menuBackgroundBlurriness,
++                this.gameRenderState.levelRenderState.cameraRenderState.pos,
++                useRgss
++            );
+     }
+ 
+     private void applyPostEffects() {
+@@ -662,16 +822,29 @@
+             projectionMatrix.rotate(-angle, axis);
+         }
+ 
+-        RenderSystem.setProjectionMatrix(this.levelProjectionMatrixBuffer.getBuffer(projectionMatrix), ProjectionType.PERSPECTIVE);
++        // Stage 4 (Tessera TAA): the rasterised projection gets the frame's sub-pixel jitter; culling and Tessera keep the exact one
++        float[] tesseraJitter = TesseraBloom.INSTANCE.taaJitter(this.mainRenderTarget.width, this.mainRenderTarget.height);
++        Matrix4f rasterProjection = tesseraJitter == null ? projectionMatrix
++            : new Matrix4f().translation(tesseraJitter[0], tesseraJitter[1], 0.0F).mul(projectionMatrix);
++        RenderSystem.setProjectionMatrix(this.levelProjectionMatrixBuffer.getBuffer(rasterProjection), ProjectionType.PERSPECTIVE);
++        TesseraBloom.INSTANCE.exactProjection = tesseraJitter == null ? null : this.tesseraExactProjectionBuffer.getBuffer(projectionMatrix);
++        // Stage-2 terrain patch: the exact projection of this frame drives terrain/cloud culling (S1, S2, S7).
++        this.minecraft.levelRenderer.setFrameProjection(projectionMatrix);
+         profiler.popPush("fog");
+         this.fogRenderer.updateBuffer(cameraState.fogData);
+         GpuBufferSlice terrainFog = this.fogRenderer.getBuffer(FogRenderer.FogMode.WORLD);
+         profiler.popPush("level");
+         boolean shouldCreateBossFog = this.minecraft.gui.hud.getBossOverlay().shouldCreateWorldFog();
+         boolean consistentDepthRequired = !this.appliedPostEffects.isEmpty();
+-        this.minecraft
+-            .levelRenderer
+-            .render(this.resourcePool, renderOutline, cameraState, terrainFog, cameraState.fogData.color, !shouldCreateBossFog, consistentDepthRequired);
++        Tessera.INSTANCE.levelFrame = Tessera.active;
++        try {
++            this.minecraft
++                .levelRenderer
++                .render(this.resourcePool, renderOutline, cameraState, terrainFog, cameraState.fogData.color, !shouldCreateBossFog, consistentDepthRequired);
++        } finally {
++            Tessera.INSTANCE.levelFrame = false;
++        }
++        TesseraBloom.INSTANCE.afterWorld(this.mainRenderTarget, consistentDepthRequired);
+         this.render3dHud(cameraState, playerState, optionsState, consistentDepthRequired);
+     }
+ 
+@@ -782,11 +955,12 @@
+         cameraState.fogData = this.fogRenderer
+             .setupFog(
+                 this.mainCamera,
+-                this.minecraft.options.getEffectiveRenderDistance(),
++                net.minecraft.client.renderer.chunk.Lod.fogRenderDistance(this.minecraft.options.getEffectiveRenderDistance()),
+                 deltaTracker,
+                 this.bossOverlayWorldDarkening(worldPartialTicks),
+                 this.minecraft.level
+             );
++        net.minecraft.client.renderer.chunk.Lod.adjustFog(cameraState.fogData, this.minecraft.options.getEffectiveRenderDistance());
+     }
+ 
+     public void resetData() {
+@@ -812,7 +986,7 @@
+     }
+ 
+     public GpuTextureView levelLightmap() {
+-        return this.lightmap.getTextureView();
++        return this.lightmap.getTextureViewForThisFrame();
+     }
+ 
+     public OverlayTexture overlayTexture() {

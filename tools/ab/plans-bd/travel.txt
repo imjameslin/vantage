@@ -1,0 +1,23 @@
+# Default-mode re-baseline (results/BASELINE-DEFAULT.md), travel (tools/bench-travel.sh: Fancy, RD 16, fresh world, warmup 10 s, 30 s).
+# 5 configs x 4 rounds, interleaved; round 2 = round 1 reversed, round 4 = round 3 reversed (every arm at mean position 2).
+# tools/ab/scorecard_default.py; vanilla OpenGL / Vulkan with SDL_VIDEO_MAC_FULLSCREEN_SPACES=0.
+travel bd-tr-main-1 main
+travel bd-tr-vk-1 vk
+travel bd-tr-r5-1 r5
+travel bd-tr-gl-1 gl
+travel bd-tr-r4-1 r4
+travel bd-tr-r4-2 r4
+travel bd-tr-gl-2 gl
+travel bd-tr-r5-2 r5
+travel bd-tr-vk-2 vk
+travel bd-tr-main-2 main
+travel bd-tr-vk-3 vk
+travel bd-tr-r4-3 r4
+travel bd-tr-main-3 main
+travel bd-tr-r5-3 r5
+travel bd-tr-gl-3 gl
+travel bd-tr-gl-4 gl
+travel bd-tr-r5-4 r5
+travel bd-tr-main-4 main
+travel bd-tr-r4-4 r4
+travel bd-tr-vk-4 vk

@@ -1,0 +1,9 @@
+# Finalize step 1 (check verdict 9): clean static rerun of the decided set vs everything off, 4+4 ABBA, nothing else on the machine; MEMLOG=1
+static r5f-st-off-1 off
+static r5f-st-WIN-1 WIN
+static r5f-st-WIN-2 WIN
+static r5f-st-off-2 off
+static r5f-st-off-3 off
+static r5f-st-WIN-3 WIN
+static r5f-st-WIN-4 WIN
+static r5f-st-off-4 off

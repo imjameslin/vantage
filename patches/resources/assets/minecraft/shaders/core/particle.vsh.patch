@@ -1,0 +1,26 @@
+--- a/assets/minecraft/shaders/core/particle.vsh
++++ b/assets/minecraft/shaders/core/particle.vsh
+@@ -17,6 +17,13 @@
+ layout(location = 1) out float cylindricalVertexDistance;
+ layout(location = 2) out vec2 texCoord0;
+ layout(location = 3) out vec4 vertexColor;
++#if defined(TESSERA) && !defined(TESSERA_WEATHER) && !defined(OIT_ALPHA_ONLY)
++// Stage 4 (Tessera): what the fragment needs to light the particle with Tessera's model (camera-relative position,
++// light levels 0..1, the unlit vertex colour)
++layout(location = 8) out vec3 tesseraP;
++layout(location = 10) out vec2 tesseraLm;
++layout(location = 11) out vec4 tesseraBase;
++#endif
+ 
+ void main() {
+     gl_Position = ProjMat * ModelViewMat * vec4(Position, 1.0);
+@@ -25,4 +32,9 @@
+     cylindricalVertexDistance = fog_cylindrical_distance(Position);
+     texCoord0 = UV0;
+     vertexColor = Color * sample_lightmap(Sampler2, UV2);
++#if defined(TESSERA) && !defined(TESSERA_WEATHER) && !defined(OIT_ALPHA_ONLY)
++    tesseraP = Position;
++    tesseraLm = clamp(vec2(UV2) / 240.0, 0.0, 1.0);
++    tesseraBase = Color;
++#endif
+ }

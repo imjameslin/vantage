@@ -1,0 +1,46 @@
+--- a/assets/minecraft/shaders/core/sky.fsh
++++ b/assets/minecraft/shaders/core/sky.fsh
+@@ -1,8 +1,13 @@
+ #version 330
+ #extension GL_ARB_separate_shader_objects : require
++#ifdef TESSERA
++#extension GL_ARB_texture_gather : require
++#endif
+ 
+ #include <minecraft:fog.glsl>
+ #include <minecraft:dynamictransforms.glsl>
++#include <minecraft:tessera.glsl>
++const float TESSERA_SKY_SHAFT = 1.0;
+ 
+ layout(location = 0) in float sphericalVertexDistance;
+ layout(location = 1) in float cylindricalVertexDistance;
+@@ -10,5 +15,28 @@
+ layout(location = 0) out vec4 fragColor;
+ 
+ void main() {
+-    fragColor = apply_fog(ColorModulator, sphericalVertexDistance, cylindricalVertexDistance, 0.0, FogSkyEnd, FogSkyEnd, FogSkyEnd, FogColor);
++    vec4 color = ColorModulator;
++#ifdef TESSERA
++    // Stage 4 (Tessera): gradient sky with sun glow (the dark disc, alpha 0.999 from SkyRenderer, stays vanilla).
++    if (TesseraSkyColor.w != 0.0 && ColorModulator.a > 0.9995) {
++        vec3 d = normalize(tesseraPosition());
++        color.rgb = tesseraSkyGlareOver(tesseraShoulder(tesseraSky(d)), d, 1.0);   // the sun's sky glare here, not in the glare pass
++        // god rays: the shafts' air that terrain shadows, taken out of the sky (in its linear light)
++        vec3 shafts = tesseraShafts(d * TESSERA_SHAFT_RANGE, true) * TESSERA_SKY_SHAFT;
++        if (shafts.r + shafts.g + shafts.b > 0.0) color.rgb = pow(max(tesseraLinear(color.rgb) - shafts, vec3(0.0)), vec3(1.0 / 2.2));
++    }
++#endif
++    vec4 fogColor = FogColor;
++#ifdef TESSERA
++    if (TesseraSkyColor.w != 0.0) fogColor.rgb = tesseraShoulder(tesseraHorizonToward(normalize(tesseraPosition())));
++#endif
++    fragColor = apply_fog(color, sphericalVertexDistance, cylindricalVertexDistance, 0.0, FogSkyEnd, FogSkyEnd, FogSkyEnd, fogColor);
++#ifdef TESSERA
++    // a quarter-step of dither (interleaved gradient noise): the wide, smooth glow round a low sun banded into rings in 8 bits
++    if (TesseraSkyColor.w != 0.0) {
++        float n = fract(52.9829189 * fract(dot(floor(gl_FragCoord.xy), vec2(0.06711056, 0.00583715))));
++        fragColor.rgb += (n - 0.5) * (1.5 / 255.0);
++    }
++#endif
++    // stage 4: the sun itself (vanilla's textured one is not drawn) is the screen-effects sun glare (tessera_sun_glare.fsh)
+ }

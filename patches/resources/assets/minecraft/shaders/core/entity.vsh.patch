@@ -1,0 +1,31 @@
+--- a/assets/minecraft/shaders/core/entity.vsh
++++ b/assets/minecraft/shaders/core/entity.vsh
+@@ -46,6 +46,14 @@
+ #ifdef GLINT
+ layout(location = 7) out vec2 texCoordGlint;
+ #endif
++#if defined(TESSERA) && !defined(EMISSIVE) && !defined(OIT_ALPHA_ONLY)
++// Stage 4 (Tessera): what the fragment needs to light the entity with Tessera's model (camera-relative position, world
++// normal, light levels 0..1, the unshaded vertex colour)
++layout(location = 8) out vec3 tesseraP;
++layout(location = 9) out vec3 tesseraN;
++layout(location = 10) out vec2 tesseraLm;
++layout(location = 11) out vec4 tesseraBase;
++#endif
+ 
+ void main() {
+     gl_Position = ProjMat * ModelViewMat * vec4(Position, 1.0);
+@@ -73,6 +81,13 @@
+ 
+     texCoord0 = UV0;
+ 
++#if defined(TESSERA) && !defined(EMISSIVE) && !defined(OIT_ALPHA_ONLY)
++    tesseraP = Position;
++    tesseraN = Normal;
++    tesseraLm = clamp(vec2(UV2) / 240.0, 0.0, 1.0);
++    tesseraBase = Color;
++#endif
++
+ #ifdef APPLY_TEXTURE_MATRIX
+     texCoord0 = (TextureMat * vec4(UV0, 0.0, 1.0)).xy;
+ #endif

@@ -1,0 +1,238 @@
+--- a/net/minecraft/client/renderer/Lightmap.java
++++ b/net/minecraft/client/renderer/Lightmap.java
+@@ -1,3 +1,18 @@
++// Patched copy of the vanilla 26.3 class (round 6 item 1, docs/metal/CONTRACT.md 16.R6-1; round 7 item 1, 16.R7-1).
++// Differences from vanilla:
++//  - a second 16x16 texture: with TexturePingPong.enabled an update ("Update light", a full-screen triangle, opaque
++//    ColorTargetState.DEFAULT, no discard: every texel rewritten) goes to the copy the previous frame did not sample, so it
++//    never waits for that frame (write-after-read). getTextureView() returns the copy written last (vanilla's texture
++//    state); notePendingUpdate() (GameRenderer.extract, once per frame, before the GUI is extracted) arms the swap, and
++//    getTextureViewForThisFrame() (GameRenderer.levelLightmap(), the F3 lightmap chart, extracted before the update runs)
++//    names the copy this frame's update will write, as vanilla's single texture holds the updated texels when that
++//    GUI blit executes. Toggle off: always the first texture, vanilla's behaviour.
++//  - R7-1 (LightmapCompute.enabled, Metal only): an update that goes to the other copy runs lightmap.fsh's arithmetic as a
++//    compute kernel on a side command buffer (MetalTickFx.lightmap) instead of the render pass. Vanilla samples the
++//    lightmap in the vertex stage; the render pass, queued behind the previous frame's fragment work, held back the next
++//    world pass's vertex work. Byte-identical (tools/lightmap-compute-test.sh). Nothing else changes.
++//  - Stage 4 (Tessera, -Dmc.shaders=true only): the kernel also writes a twin per copy with alpha = 0.5 + 0.5 * sky level,
++//    the terrain lightmap (Tessera.terrainLightmap); a render-pass update leaves the twin stale and Tessera copies instead.
+ package net.minecraft.client.renderer;
+ 
+ import com.mojang.blaze3d.buffers.Std140Builder;
+@@ -10,14 +25,20 @@
+ import com.mojang.renderpearl.api.device.GpuDevice;
+ import com.mojang.renderpearl.api.textures.GpuTexture;
+ import com.mojang.renderpearl.api.textures.GpuTextureView;
++import com.mojang.renderpearl.backend.metal.MetalTickFx;
++import com.mojang.renderpearl.backend.metal.MetalLodMaterialInputs;
++import java.nio.ByteBuffer;
+ import java.util.Optional;
+ import net.minecraft.client.renderer.state.LightmapRenderState;
++import net.minecraft.client.renderer.texture.TexturePingPong;
+ import net.minecraft.util.ARGB;
+ import net.minecraft.util.Mth;
+ import net.minecraft.util.profiling.Profiler;
+ import net.minecraft.util.profiling.ProfilerFiller;
+ import net.minecraft.world.level.dimension.DimensionType;
+ import org.joml.Vector4fc;
++import org.jspecify.annotations.Nullable;
++import org.lwjgl.system.MemoryUtil;
+ 
+ public class Lightmap implements AutoCloseable {
+     public static final int TEXTURE_SIZE = 16;
+@@ -37,58 +58,181 @@
+     private final GpuTexture texture;
+     private final GpuTextureView textureView;
+     private final MappableRingBuffer ubo;
++    /** R6-1: the second copy (created with the first; 1 KiB). */
++    private final GpuTexture textureB;
++    private final GpuTextureView textureViewB;
++    /** R6-1: the copy holding the latest update (frames sample it): false = texture, true = textureB. */
++    private boolean frontIsB;
++    /** R6-1: this frame's update goes to the other copy (armed in GameRenderer.extract, consumed by render). */
++    private boolean pendingSwap;
++    /** R7-1: std140 LightmapInfo bytes the kernel reads (vanilla's UBO is 92 bytes; the kernel takes 96). */
++    private static final int COMPUTE_INFO_BYTES = 96;
++    /** R7-1: both copies kernel-writable and the kernel compiled (Metal only). */
++    private final boolean computeReady;
++    /**
++     * R7-1: per copy (0 = texture, 1 = textureB), the stream seq (MetalTickFx.recordingSeq) of the last stream record that
++     * wrote it (the creation clear, render-pass updates). The kernel's side command buffer commits at once, so it runs on
++     * a copy only once that seq has been committed, i.e. it can never overtake an uncommitted stream write to its target.
++     */
++    private final long[] streamWriteSeq = new long[2];
++    /** R7-1: off-heap LightmapInfo for the kernel (allocated at the first kernel update, freed in close()). */
++    private @Nullable ByteBuffer computeInfo;
++    private final Object lodMaterialFamily = new Object();
++    /**
++     * Stage 4 (Tessera, -Dmc.shaders=true): per copy, the terrain lightmap twin (same texels, alpha = 0.5 + 0.5 * sky level)
++     * the kernel writes in the same dispatch; null when shaders are off. skyValid[copy]: written by the last update of that
++     * copy (a render-pass update leaves it stale: Tessera then makes its own copy).
++     */
++    private final @Nullable GpuTexture[] skyTextures = new GpuTexture[2];
++    private final @Nullable GpuTextureView[] skyViews = new GpuTextureView[2];
++    private final boolean[] skyValid = new boolean[2];
++    /** Stage 4 (Tessera): the lightmap whose twins Tessera uses (the game renderer's). */
++    static volatile @Nullable Lightmap tesseraLightmap;
+ 
+     public Lightmap() {
+         GpuDevice device = RenderSystem.getDevice();
+-        this.texture = device.createTexture("Lightmap", 13, GpuFormat.RGBA8_UNORM, 16, 16, 1, 1);
++        // R7-1: on Metal both copies are also kernel-writable (MetalTickFx; otherwise the same texture is returned).
++        this.texture = MetalTickFx.createWritable(device.createTexture("Lightmap", 13, GpuFormat.RGBA8_UNORM, 16, 16, 1, 1), "Lightmap");
+         this.textureView = device.createTextureView(this.texture);
+         device.createCommandEncoder().clearColorTexture(this.texture, CLEAR_COLOR);
++        this.textureB = MetalTickFx.createWritable(
++            device.createTexture("Lightmap (ping-pong)", 13, GpuFormat.RGBA8_UNORM, 16, 16, 1, 1), "Lightmap (ping-pong)"
++        );
++        this.textureViewB = device.createTextureView(this.textureB);
++        device.createCommandEncoder().clearColorTexture(this.textureB, CLEAR_COLOR);
++        this.computeReady = MetalTickFx.isWritable(this.texture) && MetalTickFx.isWritable(this.textureB) && MetalTickFx.prepareLightmap(this.texture);
++        this.streamWriteSeq[0] = MetalTickFx.recordingSeq(this.texture);
++        this.streamWriteSeq[1] = MetalTickFx.recordingSeq(this.textureB);
+         this.ubo = new MappableRingBuffer(() -> "Lightmap UBO", 130, LIGHTMAP_UBO_SIZE);
++        if (Tessera.ENABLED && this.computeReady) {
++            tesseraLightmap = this;
++            for (int i = 0; i < 2; i++) {
++                this.skyTextures[i] = MetalTickFx.createWritable(device.createTexture("Lightmap sky " + i, 13, GpuFormat.RGBA8_UNORM, 16, 16, 1, 1), "Lightmap sky " + i);
++                this.skyViews[i] = device.createTextureView(this.skyTextures[i]);
++            }
++        }
+     }
+ 
++    /** Stage 4 (Tessera): the terrain lightmap twin of {@code view} if the kernel wrote it with view's last update, else null. */
++    public @Nullable GpuTextureView skyTwin(final GpuTextureView view) {
++        int copy = view == this.textureViewB ? 1 : view == this.textureView ? 0 : -1;
++        return copy < 0 || !this.skyValid[copy] ? null : this.skyViews[copy];
++    }
++
+     public GpuTextureView getTextureView() {
+-        return this.textureView;
++        return this.frontIsB ? this.textureViewB : this.textureView;
+     }
+ 
++    /** R6-1: once per frame from GameRenderer.extract, after the lightmap render state is extracted. */
++    public void notePendingUpdate(final boolean needsUpdate) {
++        // Toggle off: updates go to `texture` in place, as vanilla. Switching off while textureB is the front moves the
++        // next update back to `texture` (an update rewrites every texel, so either copy can take it).
++        this.pendingSwap = needsUpdate && (TexturePingPong.enabled || this.frontIsB);
++    }
++
++    /** R6-1: the copy frames sample once this frame's update (if any) has run; GameRenderer.levelLightmap(). */
++    public GpuTextureView getTextureViewForThisFrame() {
++        return this.frontIsB != this.pendingSwap ? this.textureViewB : this.textureView;
++    }
++
+     @Override
+     public void close() {
++        MetalLodMaterialInputs.invalidate(this.texture);
++        MetalLodMaterialInputs.invalidate(this.textureB);
+         this.texture.close();
+         this.textureView.close();
++        this.textureB.close();
++        this.textureViewB.close();
+         this.ubo.close();
++        if (tesseraLightmap == this) {
++            tesseraLightmap = null;
++        }
++        for (int i = 0; i < 2; i++) {
++            if (this.skyTextures[i] != null) {
++                this.skyTextures[i].close();
++                this.skyViews[i].close();
++            }
++        }
++        if (this.computeInfo != null) {
++            MemoryUtil.memFree(this.computeInfo);
++            this.computeInfo = null;
++        }
+     }
+ 
+     public void render(final LightmapRenderState renderState) {
+         if (renderState.needsUpdate) {
+             ProfilerFiller profiler = Profiler.get();
+             profiler.push("lightmap");
++            boolean swap = this.pendingSwap;
++            if (this.pendingSwap) {
++                this.frontIsB = !this.frontIsB;
++            }
++
++            this.pendingSwap = false;
++            int copy = this.frontIsB ? 1 : 0;
++            GpuTexture targetTexture = copy == 1 ? this.textureB : this.texture;
++            var materialUpdate = MetalLodMaterialInputs.beginLightmap(this.lodMaterialFamily, targetTexture, renderState);
++            // R7-1: a swapped update writes the copy no frame in flight samples, and nothing earlier in this frame reads it
++            // (frames sample the front; the F3 chart's blit is recorded later), so once no uncommitted stream record writes
++            // it, the kernel may write it right now on a side command buffer (ordered before this frame's command buffer).
++            if (swap && LightmapCompute.enabled && this.computeReady && MetalTickFx.recordingSeq(targetTexture) > this.streamWriteSeq[copy]) {
++                if (this.computeInfo == null) {
++                    this.computeInfo = MemoryUtil.memCalloc(COMPUTE_INFO_BYTES);
++                }
++                this.computeInfo.clear();
++                putInfo(Std140Builder.intoBuffer(this.computeInfo), renderState);
++                GpuTexture sky = this.skyTextures[copy];
++                if (sky != null && Tessera.active && MetalTickFx.lightmapSky(targetTexture, sky, MemoryUtil.memAddress0(this.computeInfo), COMPUTE_INFO_BYTES)) {
++                    this.skyValid[copy] = true;
++                    MetalLodMaterialInputs.finishLightmap(materialUpdate);
++                    LightmapCompute.dispatches++;
++                    profiler.pop();
++                    return;
++                }
++                this.skyValid[copy] = false;
++                if (MetalTickFx.lightmap(targetTexture, MemoryUtil.memAddress0(this.computeInfo), COMPUTE_INFO_BYTES)) {
++                    MetalLodMaterialInputs.finishLightmap(materialUpdate);
++                    LightmapCompute.dispatches++;
++                    profiler.pop();
++                    return;
++                }
++            }
++
+             CommandEncoder commandEncoder = RenderSystem.getDevice().createCommandEncoder();
+ 
+             try (GpuBufferSlice.MappedView view = this.ubo.currentBuffer().map(false, true)) {
+-                Std140Builder.intoBuffer(view.data())
+-                    .putFloat(renderState.skyFactor)
+-                    .putFloat(renderState.blockFactor)
+-                    .putFloat(renderState.nightVisionEffectIntensity)
+-                    .putFloat(renderState.darknessEffectScale)
+-                    .putFloat(renderState.bossOverlayWorldDarkening)
+-                    .putFloat(renderState.brightness)
+-                    .putVec3(renderState.blockLightTint)
+-                    .putVec3(renderState.skyLightColor)
+-                    .putVec3(renderState.ambientColor)
+-                    .putVec3(renderState.nightVisionColor);
++                putInfo(Std140Builder.intoBuffer(view.data()), renderState);
+             }
+ 
+-            try (RenderPass renderPass = commandEncoder.createRenderPass(() -> "Update light", this.textureView, Optional.empty())) {
++            try (RenderPass renderPass = commandEncoder.createRenderPass(() -> "Update light", this.getTextureView(), Optional.empty())) {
+                 renderPass.setPipeline(RenderSystem.getCompiledPipeline(RenderPipelines.LIGHTMAP));
+                 RenderSystem.bindDefaultUniforms(renderPass);
+                 renderPass.setUniform("LightmapInfo", this.ubo.currentBuffer());
+                 renderPass.draw(3, 1, 0, 0);
+             }
+ 
++            this.streamWriteSeq[copy] = MetalTickFx.recordingSeq(targetTexture);
++            this.skyValid[copy] = false;
++            MetalLodMaterialInputs.finishLightmap(materialUpdate);
+             this.ubo.rotate();
+             profiler.pop();
+         }
+     }
+ 
++    /** Vanilla's LightmapInfo UBO contents (std140), shared by the render pass and the R7-1 kernel. */
++    private static void putInfo(final Std140Builder builder, final LightmapRenderState renderState) {
++        builder.putFloat(renderState.skyFactor)
++            .putFloat(renderState.blockFactor)
++            .putFloat(renderState.nightVisionEffectIntensity)
++            .putFloat(renderState.darknessEffectScale)
++            .putFloat(renderState.bossOverlayWorldDarkening)
++            .putFloat(renderState.brightness)
++            .putVec3(renderState.blockLightTint)
++            .putVec3(renderState.skyLightColor)
++            .putVec3(renderState.ambientColor)
++            .putVec3(renderState.nightVisionColor);
++    }
++
+     public static float getBrightness(final DimensionType dimensionType, final int level) {
+         float v = level / 15.0F;
+         float curvedV = v / (4.0F - 3.0F * v);

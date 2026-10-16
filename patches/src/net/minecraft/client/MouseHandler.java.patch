@@ -1,0 +1,39 @@
+--- a/net/minecraft/client/MouseHandler.java
++++ b/net/minecraft/client/MouseHandler.java
+@@ -22,6 +22,7 @@
+ import net.minecraft.client.input.InputQuirks;
+ import net.minecraft.client.input.MouseButtonEvent;
+ import net.minecraft.client.input.MouseButtonInfo;
++import net.minecraft.client.zoom.Zoom;
+ import net.minecraft.util.Mth;
+ import net.minecraft.util.SmoothDouble;
+ import net.minecraft.util.Util;
+@@ -182,6 +183,13 @@
+                     this.minecraft.gui.screen().mouseScrolled(xm, ym, scaledXOffset, scaledYOffset);
+                     this.minecraft.gui.screen().afterMouseAction();
+                 } else if (this.minecraft.player != null) {
++                    // Zoom key held: the wheel changes the zoom level and nothing else (no hotbar slot change, so no
++                    // slot packet; no spectator speed/menu change). Horizontal-only scrolls (macOS: Shift + wheel, and
++                    // Shift is sneak) count like vanilla's hotbar mapping below: y, or -x when y is 0. docs/features/ZOOM.md
++                    if (Zoom.onScroll(this.minecraft, scaledYOffset != 0.0 ? scaledYOffset : -scaledXOffset)) {
++                        return;
++                    }
++
+                     Vector2i wheelXY = this.scrollWheelHandler.onMouseScroll(scaledXOffset, scaledYOffset);
+                     if (wheelXY.x == 0 && wheelXY.y == 0) {
+                         return;
+@@ -342,6 +350,14 @@
+             yo = this.accumulatedDY * sens;
+         }
+ 
++        // Zoom key: constant on-screen motion per mouse count (tan(fov/2) ratio vs vanilla's FOV, so the spyglass part
++        // is not reduced twice). Exactly 1 when not zooming. docs/features/ZOOM.md
++        double zoomScale = Zoom.mouseScale();
++        if (zoomScale != 1.0) {
++            xo *= zoomScale;
++            yo *= zoomScale;
++        }
++
+         this.minecraft.getTutorial().onMouse(xo, yo);
+         if (this.minecraft.player != null) {
+             this.minecraft.player.turn(this.minecraft.options.invertMouseX().get() ? -xo : xo, this.minecraft.options.invertMouseY().get() ? -yo : yo);

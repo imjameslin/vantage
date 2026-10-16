@@ -1,0 +1,13 @@
+--- a/net/minecraft/client/gui/screens/options/VideoSettingsScreen.java
++++ b/net/minecraft/client/gui/screens/options/VideoSettingsScreen.java
+@@ -52,6 +52,10 @@
+         return new OptionInstance[]{
+             options.biomeBlendRadius(),
+             options.renderDistance(),
++            options.farsight(),
++            options.farsightQuality(),
++            options.tesseraShaders(),
++            options.renderScale(),
+             options.prioritizeChunkUpdates(),
+             options.simulationDistance(),
+             options.ambientOcclusion(),

@@ -1,0 +1,23 @@
+--- a/net/minecraft/client/renderer/blockentity/BlockEntityRenderer.java
++++ b/net/minecraft/client/renderer/blockentity/BlockEntityRenderer.java
+@@ -5,6 +5,7 @@
+ import net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState;
+ import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
+ import net.minecraft.client.renderer.state.level.CameraRenderState;
++import net.minecraft.client.zoom.Zoom;
+ import net.minecraft.world.level.block.entity.BlockEntity;
+ import net.minecraft.world.phys.Vec3;
+ import org.jspecify.annotations.Nullable;
+@@ -33,6 +34,11 @@
+     }
+ 
+     default boolean shouldRender(final T blockEntity, final Vec3 cameraPosition) {
+-        return Vec3.atCenterOf(blockEntity.getBlockPos()).closerThan(cameraPosition, this.getViewDistance());
++        Vec3 center = Vec3.atCenterOf(blockEntity.getBlockPos());
++        double viewDistance = this.getViewDistance();
++        // Zoom-aware block entity distance (docs/features/ZOOM.md): vanilla's test first; beyond it, only while the zoom
++        // key/spyglass magnifies, and only inside the zoomed view (not the wide culling frustum).
++        return center.closerThan(cameraPosition, viewDistance)
++            || Zoom.inExtraBlockEntityRange(center, cameraPosition, viewDistance, this.shouldRenderOffScreen(), this instanceof TheEndGatewayRenderer);
+     }
+ }

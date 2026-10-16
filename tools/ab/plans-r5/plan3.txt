@@ -1,0 +1,25 @@
+# Step 3: travel RD 16 Fancy, 6 arms x 4 rounds, order reversed every round
+travel r5ab-tr-off-1 off
+travel r5ab-tr-A-1 A
+travel r5ab-tr-AD-1 AD
+travel r5ab-tr-ACD-1 ACD
+travel r5ab-tr-ACDE-1 ACDE
+travel r5ab-tr-ACDEB-1 ACDE+mc.terrain.uploadBudgetKB=512
+travel r5ab-tr-ACDEB-2 ACDE+mc.terrain.uploadBudgetKB=512
+travel r5ab-tr-ACDE-2 ACDE
+travel r5ab-tr-ACD-2 ACD
+travel r5ab-tr-AD-2 AD
+travel r5ab-tr-A-2 A
+travel r5ab-tr-off-2 off
+travel r5ab-tr-off-3 off
+travel r5ab-tr-A-3 A
+travel r5ab-tr-AD-3 AD
+travel r5ab-tr-ACD-3 ACD
+travel r5ab-tr-ACDE-3 ACDE
+travel r5ab-tr-ACDEB-3 ACDE+mc.terrain.uploadBudgetKB=512
+travel r5ab-tr-ACDEB-4 ACDE+mc.terrain.uploadBudgetKB=512
+travel r5ab-tr-ACDE-4 ACDE
+travel r5ab-tr-ACD-4 ACD
+travel r5ab-tr-AD-4 AD
+travel r5ab-tr-A-4 A
+travel r5ab-tr-off-4 off

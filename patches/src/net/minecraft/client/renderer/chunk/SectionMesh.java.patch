@@ -1,0 +1,31 @@
+--- a/net/minecraft/client/renderer/chunk/SectionMesh.java
++++ b/net/minecraft/client/renderer/chunk/SectionMesh.java
+@@ -1,3 +1,8 @@
++// Patched copy of the vanilla 26.3 class (stage-2 terrain, docs/stage2/TERRAIN-PLAN.md S1/S2). Differences from vanilla:
++//  - SectionDraw carries the nullable TerrainMeshInfo of its section-layer (facing buckets, planes, bounds); the
++//    vanilla three-argument constructor is kept (info = null, which disables S1/S2 for that draw).
++//  - SectionDraw.compact (S5): the section-layer's vertices are the 16-byte TerrainCompact format (drawn with the
++//    *_COMPACT pipelines); false for every other draw.
+ package net.minecraft.client.renderer.chunk;
+ 
+ import com.mojang.renderpearl.api.pipeline.IndexType;
+@@ -42,6 +47,18 @@
+     default void close() {
+     }
+ 
+-    record SectionDraw(int indexCount, IndexType indexType, boolean hasCustomIndexBuffer) {
++    record SectionDraw(int indexCount, IndexType indexType, boolean hasCustomIndexBuffer, @Nullable TerrainMeshInfo info, boolean compact) {
++        public SectionDraw(final int indexCount, final IndexType indexType, final boolean hasCustomIndexBuffer) {
++            this(indexCount, indexType, hasCustomIndexBuffer, null, false);
++        }
++
++        public SectionDraw(final int indexCount, final IndexType indexType, final boolean hasCustomIndexBuffer, final @Nullable TerrainMeshInfo info) {
++            this(indexCount, indexType, hasCustomIndexBuffer, info, false);
++        }
++
++        /** Vertex stride of this section-layer's vertex data: 16 when stored compact (S5), else {@code blockStride}. */
++        public int vertexSize(final int blockStride) {
++            return this.compact ? TerrainCompact.STRIDE : blockStride;
++        }
+     }
+ }

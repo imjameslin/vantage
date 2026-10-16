@@ -1,0 +1,5 @@
+# Step 5b: travel frame traces of the decided set, to attribute residual max frames with pregrow
+travel r5ab-ft-tr-WIN-1 WIN --bench-prop frameTrace=true
+travel r5ab-ft-tr-WIN-2 WIN --bench-prop frameTrace=true
+travel r5ab-ft-tr-WIN-3 WIN --bench-prop frameTrace=true
+travel r5ab-ft-tr-WIN-4 WIN --bench-prop frameTrace=true

@@ -1,0 +1,24 @@
+--- a/net/minecraft/client/particle/SpellParticle.java
++++ b/net/minecraft/client/particle/SpellParticle.java
+@@ -3,6 +3,7 @@
+ import net.minecraft.client.Minecraft;
+ import net.minecraft.client.multiplayer.ClientLevel;
+ import net.minecraft.client.player.LocalPlayer;
++import net.minecraft.client.zoom.Zoom;
+ import net.minecraft.core.particles.ColorParticleOption;
+ import net.minecraft.core.particles.SimpleParticleType;
+ import net.minecraft.core.particles.SpellParticleOption;
+@@ -62,10 +63,12 @@
+     private boolean isCloseToScopingPlayer() {
+         Minecraft instance = Minecraft.getInstance();
+         LocalPlayer player = instance.player;
++        // The zoom key magnifies the near-eye effect swirls just like the spyglass does: hide them the same way
++        // (docs/features/ZOOM.md).
+         return player != null
+             && player.getEyePosition().distanceToSqr(this.x, this.y, this.z) <= 9.0
+             && instance.options.getCameraType().isFirstPerson()
+-            && player.isScoping();
++            && (player.isScoping() || Zoom.isKeyActive(instance));
+     }
+ 
+     public static class InstantProvider implements ParticleProvider<SpellParticleOption> {

@@ -1,0 +1,6 @@
+# Design check after the review of the first validation (results/ABAB.md 1): W1 with segments=8 (arms interleaved every
+# 1.25 s = 45 degrees). A/A relabelling of the earlier per-frame arrays predicts nearly the precision of segments=24 on
+# avg FPS / two-frame median; the question is whether the per-sector tail reads like segments=1 (+6.6 %) or like
+# segments=24 (+4.2 %). Client build/client-abab.jar, ABAB_BENCH_JAR=build/bench-abab3.jar (segments supported).
+abab w1ab-s8-1 build/client-abab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20 --bench-prop abab.segments=8
+abab w1ab-s8-2 build/client-abab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20 --bench-prop abab.segments=8

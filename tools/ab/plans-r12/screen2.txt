@@ -1,0 +1,7 @@
+# Round 12 screening (build/client-r12b.jar): (a) GPU cluster culling (A = per-record draws, B = cluster draws), and a second
+# look at (b) the fan quad index order (s12-qio-spin call +0.17 %).
+abab s12-cl-spin build/client-r12b.jar --jvm=-Dmc.terrain.clusters=true --jvm=-Dmc.terrain.clusters.stats=10 --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainClusters#enabled=false|true
+abab s12-cl-heavy build/client-r12b.jar --jvm=-Dmc.terrain.clusters=true --jvm=-Dmc.terrain.clusters.stats=10 --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainClusters#enabled=false|true --bench-prop abab.preset=heavy
+abab s12-cl-y232 build/client-r12b.jar --jvm=-Dmc.terrain.clusters=true --jvm=-Dmc.terrain.clusters.stats=10 --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainClusters#enabled=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab s12-qio-spin2 build/client-r12b.jar --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainToggles#quadIndexOrder=0|1
+abab s12-qio-y232 build/client-r12b.jar --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainToggles#quadIndexOrder=0|1 --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5

@@ -1,0 +1,11 @@
+# made by setup.sh from your own Minecraft download (never committed)
+/mc/
+/src/vanilla/
+/tools/lib/
+# rebuilt from patches/ by setup.sh
+/client/src/**/*.java.orig
+/build/
+/run/
+/results/raw/
+*.log
+.DS_Store

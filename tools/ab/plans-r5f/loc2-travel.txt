@@ -1,0 +1,10 @@
+# Travel r5 vs r4 again (4+4 ABBA) after the display state changed during loc-travel (alerts gone, presented FPS ~170
+# instead of 60): records whether the r5-vs-r4 travel median depends on that state.
+travel r5f-loc2-tr-r5-1 r5
+travel r5f-loc2-tr-r4-1 r4
+travel r5f-loc2-tr-r4-2 r4
+travel r5f-loc2-tr-r5-2 r5
+travel r5f-loc2-tr-r5-3 r5
+travel r5f-loc2-tr-r4-3 r4
+travel r5f-loc2-tr-r4-4 r4
+travel r5f-loc2-tr-r5-4 r5

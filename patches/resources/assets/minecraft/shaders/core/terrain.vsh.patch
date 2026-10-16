@@ -1,0 +1,119 @@
+--- a/assets/minecraft/shaders/core/terrain.vsh
++++ b/assets/minecraft/shaders/core/terrain.vsh
+@@ -10,10 +10,18 @@
+     #include <minecraft:chunksection.glsl>
+ #endif
+ 
++#ifdef TERRAIN_COMPACT
++// Stage-2 terrain patch S5 (docs/stage2/TERRAIN-PLAN.md 4.5, chunk/TerrainCompact): 16-byte vertex, used only for
++// section-layers whose every vertex decodes to exactly the vanilla Position, UV0 and UV2 values.
++layout(location = 0) in uvec4 Position;
++layout(location = 1) in vec4 Color;
++layout(location = 2) in uvec2 UV0;
++#else
+ layout(location = 0) in vec3 Position;
+ layout(location = 1) in vec4 Color;
+ layout(location = 2) in vec2 UV0;
+ layout(location = 3) in ivec2 UV2;
++#endif
+ #ifdef MULTIDRAW_TERRAIN
+ layout(location = 4) in ivec3 ChunkPosition;
+ layout(location = 5) in float ChunkVisibility;
+@@ -22,25 +30,97 @@
+ #ifndef OIT_ALPHA_ONLY
+ uniform sampler2D Sampler2;
+ #endif
++#if defined(TESSERA) && !defined(TERRAIN_GREEDY)
++uniform sampler2D TesseraMaterial;   // Tessera#updateMaterialMask: r * 3 = 1 plants, 2 leaves
++#endif
+ 
+ layout(location = 0) out float sphericalVertexDistance;
+ layout(location = 1) out float cylindricalVertexDistance;
+ layout(location = 2) out vec4 vertexColor;
+ layout(location = 3) out vec2 texCoord0;
+ layout(location = 4) out float chunkVisibility;
++#ifdef TESSERA
++// Stage 4 (Tessera lighting): the unlit vertex colour (biome tint x vanilla AO x face shade) and the light levels
++// (x = block, y = sky; 0..1), so terrain.fsh lights the surface itself.
++layout(location = 6) out vec4 tesseraBase;
++layout(location = 7) out vec2 tesseraLm;
++#endif
++#ifdef TERRAIN_GREEDY
++// Round 12 Part B prototype (chunk/TerrainGreedy): UV2's high bytes carry the atlas tile (+1) of a merged face, 0 otherwise.
++layout(location = 5) flat out ivec2 greedyTile;
++#endif
+ 
+ void main() {
++#ifdef TERRAIN_COMPACT
++    // Exact decodes: 16-bit integers to float, an integer bias, power-of-two scales.
++    vec3 blockPosition = vec3(ivec3(Position.xyz) - 16384) * (1.0 / 2048.0);
++    ivec2 lightUv = ivec2(int(Position.w & 0xFFu), int(Position.w >> 8u));
++    vec2 textureUv = vec2(UV0) * (1.0 / 32768.0);
++    vec3 pos = blockPosition + (ChunkPosition - CameraBlockPos) + CameraOffset;
++#else
+     vec3 pos = Position + (ChunkPosition - CameraBlockPos) + CameraOffset;
++#endif
++#if defined(TESSERA_SWAY) && !defined(TERRAIN_GREEDY)
++    // Stage 4 (Tessera waving): leaves sway at every corner, plants at their top corners, by world position and time (a
++    // shared corner moves the same in every block, so nothing cracks). The material comes from the atlas mask at the
++    // vertex's UV moved half a cell into its sprite (vanilla quads: corners 0 / 3 top, 0 / 1 at u0). Every line names a
++    // tessera value: TerrainVertexMsl strips them when matching the vanilla shape and adds its own form.
++    int tesseraCorner = gl_VertexIndex & 3;
++    #ifdef TERRAIN_COMPACT
++    vec2 tesseraWaveUv = textureUv;
++    vec3 tesseraWorld = vec3(ChunkPosition & ivec3(4095)) + blockPosition;
++    #else
++    vec2 tesseraWaveUv = UV0;
++    vec3 tesseraWorld = vec3(ChunkPosition & ivec3(4095)) + Position;
++    #endif
++    bool tesseraTop = tesseraCorner == 0 || tesseraCorner == 3;
++    vec2 tesseraCells = vec2(textureSize(TesseraMaterial, 0));
++    vec2 tesseraNudge = vec2(tesseraCorner < 2 ? 0.5 : -0.5, tesseraTop ? 0.5 : -0.5);
++    ivec2 tesseraCell = ivec2(clamp(floor(tesseraWaveUv * tesseraCells + tesseraNudge), vec2(0.0), tesseraCells - 1.0));
++    float tesseraMat = floor(texelFetch(TesseraMaterial, tesseraCell, 0).r * 3.0 + 0.5);
++    float tesseraAmp = 0.035 * step(1.5, tesseraMat) * step(tesseraMat, 2.5) + 0.075 * step(0.5, tesseraMat) * step(tesseraMat, 1.5) * float(tesseraTop);
++    float tesseraPhase = dot(tesseraWorld.xz, vec2(0.37, 0.29)) + tesseraWorld.y * 0.21 + GameTime * 2040.0;
++    vec3 tesseraSway = vec3(sin(tesseraPhase) + 0.45 * sin(tesseraPhase * 2.3 + tesseraWorld.z * 0.7), 0.35 * sin(tesseraPhase * 1.3 + tesseraWorld.x),
++        0.8 * cos(tesseraPhase * 0.83 + tesseraWorld.x * 0.5) + 0.3 * sin(tesseraPhase * 1.9));
++    pos += tesseraSway * tesseraAmp;
++#endif
+     gl_Position = ProjMat * ModelViewMat * vec4(pos, 1.0);
+ 
+     sphericalVertexDistance = fog_spherical_distance(pos);
+     cylindricalVertexDistance = fog_cylindrical_distance(pos);
++#ifdef TERRAIN_COMPACT
+     #ifndef OIT_ALPHA_ONLY
++    vertexColor = Color * sample_lightmap(Sampler2, lightUv);
++    #else
++    vertexColor = Color;
++    #endif
++    texCoord0 = textureUv;
++#else
++    #ifndef OIT_ALPHA_ONLY
++    #ifdef TERRAIN_GREEDY
++    vertexColor = Color * sample_lightmap(Sampler2, UV2 & 0xFF);
++    #else
+     vertexColor = Color * sample_lightmap(Sampler2, UV2);
++    #endif
+     #else
+     vertexColor = Color;
+     #endif
+     texCoord0 = UV0;
++#endif
++#ifdef TERRAIN_GREEDY
++    greedyTile = (UV2 >> 8) & 0xFF;
++#endif
++#ifdef TESSERA
++    tesseraBase = Color;
++    #ifdef TERRAIN_COMPACT
++    vec2 tesseraUv = vec2(lightUv);
++    #elif defined(TERRAIN_GREEDY)
++    vec2 tesseraUv = vec2(UV2 & 0xFF);
++    #else
++    vec2 tesseraUv = vec2(UV2);
++    #endif
++    tesseraLm = clamp(tesseraUv / 240.0, 0.0, 1.0);
++#endif
+ 
+     const float chunkFullyVisibleRange = 16.0;
+     float dist = length(pos);

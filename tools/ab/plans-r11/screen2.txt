@@ -1,0 +1,5 @@
+# Round 11 (build/client-r11b.jar, default variant vfog,hvary): spin x2, heavy, median view; A = exact PSOs, B = variant.
+abab s2-spin-1 build/client-r11b.jar --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.TerrainShaderVariants#useVariant=false|true
+abab s2-spin-2 build/client-r11b.jar --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.TerrainShaderVariants#useVariant=false|true
+abab s2-heavy build/client-r11b.jar --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.TerrainShaderVariants#useVariant=false|true --bench-prop abab.preset=heavy
+abab s2-y232 build/client-r11b.jar --bench-prop abab.toggles=com.mojang.renderpearl.backend.metal.TerrainShaderVariants#useVariant=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5

@@ -1,0 +1,20 @@
+# W1 (HUD vignette no-op skip) sensitivity check of mode=abab against the classic protocol (CONTRACT 16.AB).
+# Client: build/client-w1ab.jar (main + W1 merge); bench: ABAB_BENCH_JAR=build/bench-abab2.jar. A = vanilla vignette
+# draw (-Dmc.hud.vignetteSkipNoop=false / enabled=false), B = W1 (default on). Warmup 20 s in both protocols: the skip
+# needs the vignette colour to reach RGB 0, 552 ticks (27.6 s) after joining, so every measured frame is past it.
+# 1. A/A with abab.segments=24 (interleaved arms), 3 launches.
+abab abab-aa24-1 build/client-r5.jar --bench-prop abab.toggles=bench.Abab#aaNoop=0|1 --bench-prop abab.segments=24
+abab abab-aa24-2 build/client-r5.jar --bench-prop abab.toggles=bench.Abab#aaNoop=0|1 --bench-prop abab.segments=24
+abab abab-aa24-3 build/client-r5.jar --bench-prop abab.toggles=bench.Abab#aaNoop=0|1 --bench-prop abab.segments=24
+# 2. Classic interleaved full-launch A/B, 3+3 (bench-one protocol, warmup 20), order ABBAAB.
+classic w1c-off-1 build/client-w1ab.jar --jvm=-Dmc.hud.vignetteSkipNoop=false --bench-prop warmup=20
+classic w1c-on-1 build/client-w1ab.jar --bench-prop warmup=20
+classic w1c-on-2 build/client-w1ab.jar --bench-prop warmup=20
+classic w1c-off-2 build/client-w1ab.jar --jvm=-Dmc.hud.vignetteSkipNoop=false --bench-prop warmup=20
+classic w1c-off-3 build/client-w1ab.jar --jvm=-Dmc.hud.vignetteSkipNoop=false --bench-prop warmup=20
+classic w1c-on-3 build/client-w1ab.jar --bench-prop warmup=20
+# 3. abab screens of W1: per-spin arms (segments=1, as specified) and interleaved arms (segments=24).
+abab w1ab-s1-1 build/client-w1ab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20
+abab w1ab-s24-1 build/client-w1ab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20 --bench-prop abab.segments=24
+abab w1ab-s1-2 build/client-w1ab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20
+abab w1ab-s24-2 build/client-w1ab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20 --bench-prop abab.segments=24

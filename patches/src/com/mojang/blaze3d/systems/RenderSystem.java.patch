@@ -1,0 +1,27 @@
+--- a/com/mojang/blaze3d/systems/RenderSystem.java
++++ b/com/mojang/blaze3d/systems/RenderSystem.java
+@@ -210,6 +210,13 @@
+         SDLHints.SDL_SetHint("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
+         SDLHints.SDL_SetHint("SDL_ENABLE_SCREEN_KEYBOARD", "0");
+         SDLHints.SDL_SetHint("SDL_IME_IMPLEMENTED_UI", "composition");
++        // macOS: fullscreen as a borderless screen-sized window instead of a separate Space. WindowServer
++        // can pace Spaces fullscreen windows at the display refresh (measured: vanilla Vulkan pinned at 240,
++        // Metal at 120/300), while the non-Spaces window presents uncapped. -Dmc.fullscreenSpaces=true restores
++        // vanilla behaviour.
++        if (net.minecraft.util.Util.getPlatform() == net.minecraft.util.Util.OS.OSX && !Boolean.getBoolean("mc.fullscreenSpaces")) {
++            SDLHints.SDL_SetHint("SDL_VIDEO_MAC_FULLSCREEN_SPACES", "0");
++        }
+         if (!SDLInit.SDL_Init(32)) {
+             throw new IllegalStateException("Unable to initialize SDL: " + SDLError.SDL_GetError());
+         } else {
+@@ -384,6 +391,10 @@
+         if (shaderLights != null) {
+             renderPass.setUniform("Lighting", shaderLights);
+         }
++        // Stage 4 (Tessera): entities are lit by Tessera's model during the level render, vanilla's elsewhere (GUI, hand)
++        if (net.minecraft.client.renderer.Tessera.ENABLED) {
++            net.minecraft.client.renderer.Tessera.INSTANCE.bindDefault(renderPass);
++        }
+     }
+ 
+     public static void resizeAllAutoStorageIndexBuffers() {

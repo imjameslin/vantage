@@ -1,0 +1,21 @@
+--- a/net/minecraft/client/renderer/entity/FishingHookRenderer.java
++++ b/net/minecraft/client/renderer/entity/FishingHookRenderer.java
+@@ -10,6 +10,7 @@
+ import net.minecraft.client.renderer.rendertype.RenderTypes;
+ import net.minecraft.client.renderer.state.level.CameraRenderState;
+ import net.minecraft.client.renderer.texture.OverlayTexture;
++import net.minecraft.client.zoom.Zoom;
+ import net.minecraft.resources.Identifier;
+ import net.minecraft.util.Mth;
+ import net.minecraft.world.entity.HumanoidArm;
+@@ -81,6 +82,10 @@
+                 .scale(viewBobbingScale)
+                 .yRot(swing * 0.5F)
+                 .xRot(-swing * 0.7F);
++            // Zoom key: the rod is drawn with the unzoomed hand FOV, so keep the line start where vanilla's projection
++            // would show it (at the rod tip) instead of letting the zoom push it off screen. Identity when not zooming.
++            // docs/features/ZOOM.md
++            viewVec = Zoom.keepScreenPosition(viewVec, this.entityRenderDispatcher.camera.forwardVector());
+             return owner.getEyePosition(partialTicks).add(viewVec);
+         } else {
+             float ownerYRot = Mth.lerp(partialTicks, owner.yBodyRotO, owner.yBodyRot) * 0.017453292F;

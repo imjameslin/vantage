@@ -1,0 +1,59 @@
+--- a/assets/minecraft/shaders/core/item.fsh
++++ b/assets/minecraft/shaders/core/item.fsh
+@@ -1,5 +1,6 @@
+ #version 330
+ #extension GL_ARB_separate_shader_objects : require
++#extension GL_ARB_texture_gather : enable
+ 
+ #ifdef GLINT
+ #include <minecraft:globals.glsl>
+@@ -7,6 +8,10 @@
+ #include <minecraft:fog.glsl>
+ #include <minecraft:dynamictransforms.glsl>
+ #include <minecraft:oit.glsl>
++#if defined(TESSERA) && !defined(OIT_ALPHA_ONLY)
++#define TESSERA_ENTITY
++#include <minecraft:tessera.glsl>
++#endif
+ 
+ uniform sampler2D Sampler0;
+ 
+@@ -28,6 +33,13 @@
+ layout(location = 6) in vec2 texCoordGlint;
+ #endif
+ 
++#ifdef TESSERA_ENTITY
++layout(location = 8) in vec3 tesseraP;
++layout(location = 9) in vec3 tesseraN;
++layout(location = 10) in vec2 tesseraLm;
++layout(location = 11) in vec4 tesseraBase;
++#endif
++
+ #ifndef OIT_ALPHA_ONLY
+ layout(location = 0) out vec4 fragColor;
+ #endif
+@@ -62,6 +74,24 @@
+     }
+     #endif
+ 
++#ifdef TESSERA_ENTITY
++    // Stage 4 (Tessera): during the level render (held, dropped, framed items) lit like the terrain and tonemapped;
++    // elsewhere (GUI) vanilla's look
++    if (TesseraSkyColor.w != 0.0) {
++        vec4 albedo = color * tesseraBase * ColorModulator;
++        albedo.rgb = mix(overlayColor.rgb, albedo.rgb, overlayColor.a);
++        float tesseraLit;
++        albedo.rgb = tesseraTonemap(tesseraLinear(albedo.rgb * tesseraTerrainLight(tesseraP, normalize(tesseraN), tesseraLm, 0.0, tesseraLit)));
++    #ifdef GLINT
++        vec4 glintColor = GlintAlpha * texture(GlintSampler, texCoordGlint);
++        albedo.rgb += glintColor.rgb * glintColor.rgb;
++        albedo.a = max(albedo.a, GlintAlpha);
++    #endif
++        fragColor = apply_fog(albedo, sphericalVertexDistance, cylindricalVertexDistance, FogEnvironmentalStart, FogEnvironmentalEnd,
++            FogRenderDistanceStart, FogRenderDistanceEnd, FogColor);
++        return;
++    }
++#endif
+     color *= vertexColor * ColorModulator;
+ 
+     #ifdef GLINT

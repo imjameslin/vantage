@@ -1,0 +1,29 @@
+--- a/net/minecraft/client/gui/render/GuiRenderer.java
++++ b/net/minecraft/client/gui/render/GuiRenderer.java
+@@ -1,3 +1,8 @@
++// Patched copy of the vanilla 26.3 class (round 6 G1, docs/metal/CONTRACT.md 16.G1). Differences from vanilla:
++//  - prepare(): sorts with GuiElementOrder.INSTANCE (ELEMENT_SORT_COMPARATOR written out by hand: same keys, same signs)
++//    when GuiLayerIndex.enabled (-Dmc.gui.layerIndex, default on).
++//  - addElementToMesh(): an identical TextureSetup reference skips the record equals() (equals is reflexive: same
++//    result). Nothing else changes.
+ package net.minecraft.client.gui.render;
+ 
+ import com.google.common.collect.ImmutableMap;
+@@ -163,7 +168,7 @@
+         this.preparePictureInPicture();
+         this.prepareItemElements();
+         this.prepareText();
+-        this.renderState.sortElements(ELEMENT_SORT_COMPARATOR);
++        this.renderState.sortElements(net.minecraft.client.renderer.state.gui.GuiLayerIndex.enabled ? GuiElementOrder.INSTANCE : ELEMENT_SORT_COMPARATOR);
+         this.addElementsToMeshes(GuiRenderState.TraverseRange.BEFORE_BLUR);
+         this.firstDrawIndexAfterBlur = this.draws.size();
+         this.addElementsToMeshes(GuiRenderState.TraverseRange.AFTER_BLUR);
+@@ -233,7 +238,7 @@
+         if (this.previousDraw == null
+             || pipeline != this.previousPipeline
+             || this.scissorChanged(scissorArea, this.previousScissorArea)
+-            || !textureSetup.equals(this.previousTextureSetup)) {
++            || textureSetup != this.previousTextureSetup && !textureSetup.equals(this.previousTextureSetup)) {
+             this.previousPipeline = pipeline;
+             this.previousTextureSetup = textureSetup;
+             this.previousScissorArea = scissorArea;

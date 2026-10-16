@@ -1,0 +1,11 @@
+--- a/net/minecraft/server/level/TicketType.java
++++ b/net/minecraft/server/level/TicketType.java
+@@ -23,6 +23,8 @@
+     public static final TicketType PORTAL = register("portal", 300L, 15);
+     public static final TicketType ENDER_PEARL = register("ender_pearl", 40L, 14);
+     public static final TicketType UNKNOWN = register("unknown", 1L, 18);
++    /** Farsight: chunks the integrated server generates for the far terrain (loads, never simulates; removed when captured). */
++    public static final TicketType FARSIGHT = register("farsight", 0L, 2);
+ 
+     private static TicketType register(final String name, final long timeout, final @TicketType.Flags int flags) {
+         return Registry.register(BuiltInRegistries.TICKET_TYPE, name, new TicketType(timeout, flags));

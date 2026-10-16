@@ -1,0 +1,7 @@
+# On-glass check, launches 2-4 + one travel run (results/BASELINE-DEFAULT.md): main + MCMTL_GLASS_TRACE with refresh coverage
+# and target timestamps (SCORECARD_GLASS_JAR=build/client-bd-glass2.jar), the user's setup (fullscreen non-Spaces, RD 16,
+# vsync off). Interleaved with the static scorecard (separate runner, same GPU lock queue).
+static bd-glass-2 glass --opt renderDistance:16 --env MCMTL_GLASS_TRACE=1 --env MCMTL_GLASS_TRACE_OUT=bd-glass-2.glass.csv
+static bd-glass-3 glass --opt renderDistance:16 --env MCMTL_GLASS_TRACE=1 --env MCMTL_GLASS_TRACE_OUT=bd-glass-3.glass.csv
+static bd-glass-4 glass --opt renderDistance:16 --env MCMTL_GLASS_TRACE=1 --env MCMTL_GLASS_TRACE_OUT=bd-glass-4.glass.csv
+travel bd-glass-tr-1 glass --env MCMTL_GLASS_TRACE=1 --env MCMTL_GLASS_TRACE_OUT=bd-glass-tr-1.glass.csv

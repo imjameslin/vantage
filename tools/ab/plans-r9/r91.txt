@@ -1,0 +1,4 @@
+# R9-1 translucent facing (build/client-r9a.jar): A = full sorted list (vanilla), B = short list when valid.
+abab r91-heavy build/client-r9a.jar --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainToggles#translucentFacingDraw=false|true --bench-prop abab.preset=heavy --jvm=-Dmc.terrain.stats=false
+abab r91-y232 build/client-r9a.jar --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainToggles#translucentFacingDraw=false|true --bench-prop abab.preset=heavy --bench-prop abab.heavyYaw=232.5
+abab r91-spin build/client-r9a.jar --bench-prop abab.toggles=net.minecraft.client.renderer.chunk.TerrainToggles#translucentFacingDraw=false|true

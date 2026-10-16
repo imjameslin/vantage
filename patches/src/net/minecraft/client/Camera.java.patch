@@ -1,0 +1,30 @@
+--- a/net/minecraft/client/Camera.java
++++ b/net/minecraft/client/Camera.java
+@@ -9,6 +9,7 @@
+ import net.minecraft.client.renderer.Projection;
+ import net.minecraft.client.renderer.culling.Frustum;
+ import net.minecraft.client.renderer.state.level.CameraRenderState;
++import net.minecraft.client.zoom.Zoom;
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.core.Direction;
+ import net.minecraft.tags.FluidTags;
+@@ -89,7 +90,7 @@
+ 
+     public void update(final DeltaTracker deltaTracker) {
+         float renderDistance = this.minecraft.options.getEffectiveRenderDistance() * 16;
+-        this.depthFar = Math.max(renderDistance * 4.0F, this.minecraft.options.cloudRange().get() * 16);
++        this.depthFar = net.minecraft.client.renderer.chunk.Lod.depthFar(Math.max(renderDistance * 4.0F, this.minecraft.options.cloudRange().get() * 16));
+         LocalPlayer player = this.minecraft.player;
+         if (player != null && this.level != null) {
+             if (this.entity == null) {
+@@ -225,7 +226,9 @@
+         }
+ 
+         float fov = this.minecraft.options.fov().get().intValue() * Mth.lerp(partialTicks, this.oldFovModifier, this.fovModifier);
+-        return this.modifyFovBasedOnDeathOrFluid(partialTicks, fov);
++        // Zoom key (docs/features/ZOOM.md): eased per frame, multiplied onto vanilla's FOV (spyglass, sprint, fluid, death
++        // included). hudFov (hand) and the culling projection (max(fov, option fov)) are left as vanilla.
++        return Zoom.onFrame(this.minecraft, this.modifyFovBasedOnDeathOrFluid(partialTicks, fov));
+     }
+ 
+     private float calculateHudFov(final float partialTicks) {

@@ -1,0 +1,29 @@
+--- a/net/minecraft/client/renderer/fog/FogRenderer.java
++++ b/net/minecraft/client/renderer/fog/FogRenderer.java
+@@ -32,7 +32,9 @@
+ import org.lwjgl.system.MemoryStack;
+ 
+ public class FogRenderer implements AutoCloseable {
+-    public static final int FOG_UBO_SIZE = new Std140SizeCalculator().putVec4().putFloat().putFloat().putFloat().putFloat().putFloat().putFloat().get();
++    public static final int FOG_UBO_SIZE = new Std140SizeCalculator().putVec4().putFloat().putFloat().putFloat().putFloat().putFloat().putFloat()
++        // Stage 3 LOD fog (CONTRACT 16.S3-LOD-FOG): FogLodStart, FogLodCompress (fog.glsl).
++        .putFloat().putFloat().get();
+     private static final List<FogEnvironment> FOG_ENVIRONMENTS = Lists.newArrayList(
+         new FogEnvironment[]{
+             new LavaFogEnvironment(),
+@@ -55,6 +57,7 @@
+         try {
+             ByteBuffer buffer = stack.malloc(FOG_UBO_SIZE);
+             this.updateBuffer(buffer, 0, new Vector4f(0.0F), 3.4028235E38F, 3.4028235E38F, 3.4028235E38F, 3.4028235E38F, 3.4028235E38F, 3.4028235E38F);
++            buffer.putFloat(0.0F).putFloat(0.0F);
+             this.emptyBuffer = device.createBuffer(() -> "Empty fog", 128, buffer.flip());
+         } catch (Throwable var6) {
+             if (stack != null) {
+@@ -209,6 +212,7 @@
+                 fog.skyEnd,
+                 fog.cloudEnd
+             );
++            view.data().putFloat(40, net.minecraft.client.renderer.chunk.Lod.fogLodStart()).putFloat(44, net.minecraft.client.renderer.chunk.Lod.fogLodCompress());
+         }
+     }
+ 

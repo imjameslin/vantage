@@ -1,0 +1,36 @@
+# Step 2b: diagnostics (not for FPS): decoder copy stats with A and A+rename
+static r5ab-diag-cs-A A --env MCMTL_COPY_STATS=1
+static r5ab-diag-cs-AR AR --env MCMTL_COPY_STATS=1
+# Step 2c: static frame-trace attribution on top of A (ABBA)
+static r5ab-ft2-st-A-1 A --bench-prop frameTrace=true
+static r5ab-ft2-st-AR-1 AR --bench-prop frameTrace=true
+static r5ab-ft2-st-AH-1 AH --bench-prop frameTrace=true
+static r5ab-ft2-st-AD-1 AD --bench-prop frameTrace=true
+static r5ab-ft2-st-AD-2 AD --bench-prop frameTrace=true
+static r5ab-ft2-st-AH-2 AH --bench-prop frameTrace=true
+static r5ab-ft2-st-AR-2 AR --bench-prop frameTrace=true
+static r5ab-ft2-st-A-2 A --bench-prop frameTrace=true
+# Step 2d: static FPS, 6 arms x 3 rounds (order reversed every round)
+static r5ab-st2-off-1 off
+static r5ab-st2-A-1 A
+static r5ab-st2-AR-1 AR
+static r5ab-st2-AH-1 AH
+static r5ab-st2-AD-1 AD
+static r5ab-st2-ACD-1 ACD
+static r5ab-st2-ACD-2 ACD
+static r5ab-st2-AD-2 AD
+static r5ab-st2-AH-2 AH
+static r5ab-st2-AR-2 AR
+static r5ab-st2-A-2 A
+static r5ab-st2-off-2 off
+static r5ab-st2-off-3 off
+static r5ab-st2-A-3 A
+static r5ab-st2-AR-3 AR
+static r5ab-st2-AH-3 AH
+static r5ab-st2-AD-3 AD
+static r5ab-st2-ACD-3 ACD
+# Step 3b: travel frame-trace attribution of the max frames, ACD vs ACDE (ABBA)
+travel r5ab-ft-tr-ACD-1 ACD --bench-prop frameTrace=true
+travel r5ab-ft-tr-ACDE-1 ACDE --bench-prop frameTrace=true
+travel r5ab-ft-tr-ACDE-2 ACDE --bench-prop frameTrace=true
+travel r5ab-ft-tr-ACD-2 ACD --bench-prop frameTrace=true

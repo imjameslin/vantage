@@ -1,0 +1,8 @@
+# Final default design segments=24 (validate2 showed segments=8 noisier than 24 on every metric, within the same A/A runs
+# too, and no better on W1's sector tail). Same jar code as bench-abab4 except the default; frozen as
+# ABAB_BENCH_JAR=build/bench-abab5.jar. Client build/client-abab.jar. With the first pass's abab-aa24-1..3 and
+# w1ab-s24-1..2 (analysed with the current statistics) this gives 5 A/A and 4 W1 launches at segments=24.
+abab abab-aa24-4 build/client-abab.jar --bench-prop abab.toggles=bench.Abab#aaNoop=0|1
+abab abab-aa24-5 build/client-abab.jar --bench-prop abab.toggles=bench.Abab#aaNoop=0|1
+abab w1ab-s24-3 build/client-abab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20
+abab w1ab-s24-4 build/client-abab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20

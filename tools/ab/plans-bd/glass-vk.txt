@@ -1,0 +1,5 @@
+# On-glass check of vanilla 26.3 Vulkan (results/BASELINE-DEFAULT.md): is vanilla direct-to-display in Default mode?
+# The injectable observer (tools/glass/build.sh -> build/glass/libglassobs.dylib) runs the same trace in the vanilla process.
+# RD 12 = the scorecard's static setup, RD 16 = the user's setup (the patched client's glass runs).
+static bd-glass-vk-1 vk "--env=DYLD_INSERT_LIBRARIES={ROOT}/build/glass/libglassobs.dylib" --env MCMTL_GLASS_TRACE=1 --env MCMTL_GLASS_TRACE_OUT=bd-glass-vk-1.glass.csv
+static bd-glass-vk16-1 vk --opt renderDistance:16 "--env=DYLD_INSERT_LIBRARIES={ROOT}/build/glass/libglassobs.dylib" --env MCMTL_GLASS_TRACE=1 --env MCMTL_GLASS_TRACE_OUT=bd-glass-vk16-1.glass.csv

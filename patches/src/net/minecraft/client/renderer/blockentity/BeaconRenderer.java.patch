@@ -1,0 +1,76 @@
+--- a/net/minecraft/client/renderer/blockentity/BeaconRenderer.java
++++ b/net/minecraft/client/renderer/blockentity/BeaconRenderer.java
+@@ -11,6 +11,7 @@
+ import net.minecraft.client.renderer.rendertype.RenderTypes;
+ import net.minecraft.client.renderer.state.level.CameraRenderState;
+ import net.minecraft.client.renderer.texture.OverlayTexture;
++import net.minecraft.client.zoom.Zoom;
+ import net.minecraft.resources.Identifier;
+ import net.minecraft.util.ARGB;
+ import net.minecraft.util.Mth;
+@@ -48,7 +49,11 @@
+         state.sections = blockEntity.getBeamSections().stream().map(section -> new BeaconRenderState.Section(section.getColor(), section.getHeight())).toList();
+         float distanceToBeacon = (float)cameraPosition.subtract(Vec3.atCenterOf(state.blockPos)).horizontalDistance();
+         LocalPlayer player = Minecraft.getInstance().player;
+-        state.beamRadiusScale = player != null && player.isScoping() ? 1.0F : Math.max(1.0F, distanceToBeacon / 96.0F);
++        // Vanilla widens far beams for visibility but not while scoping; the zoom key gets the same treatment, scaled by
++        // its magnification (docs/features/ZOOM.md). distanceScale() is exactly 1 when not zoomed (vanilla divisor).
++        state.beamRadiusScale = player != null && player.isScoping()
++            ? 1.0F
++            : Math.max(1.0F, distanceToBeacon / (96.0F * (float)Zoom.distanceScale()));
+     }
+ 
+     public void submit(final BeaconRenderState state, final PoseStack poseStack, final SubmitNodeCollector submitNodeCollector, final CameraRenderState camera) {
+@@ -102,16 +107,12 @@
+         float texVOff = Mth.frac(scroll * 0.2F - Mth.floor(scroll * 0.1F));
+         poseStack.pushPose();
+         poseStack.rotateDegrees(Axis.YP, animationTime * 2.25F - 45.0F);
+-        float wnx = 0.0F;
++        // Decompiler artifact fixed: the glow pass reused the solid pass's locals, which lambdas cannot capture; the
++        // glow pass now has its own (same values, same order of float operations as vanilla).
+         float wnz = solidBeamRadius;
+         float enx = solidBeamRadius;
+-        float enz = 0.0F;
+         float wsx = -solidBeamRadius;
+-        float wsz = 0.0F;
+-        float esx = 0.0F;
+         float esz = -solidBeamRadius;
+-        float uu1 = 0.0F;
+-        float uu2 = 1.0F;
+         float vv2 = -1.0F + texVOff;
+         float vv1 = height * scale * (0.5F / solidBeamRadius) + vv2;
+         submitNodeCollector.submitCustomGeometry(
+@@ -120,22 +121,20 @@
+             (pose, buffer) -> renderPart(pose, buffer, color, beamStart, beamEnd, 0.0F, wnz, enx, 0.0F, wsx, 0.0F, 0.0F, esz, 0.0F, 1.0F, vv1, vv2)
+         );
+         poseStack.popPose();
+-        wnx = -beamGlowRadius;
+-        wnz = -beamGlowRadius;
+-        enx = beamGlowRadius;
+-        enz = -beamGlowRadius;
+-        wsx = -beamGlowRadius;
+-        wsz = beamGlowRadius;
+-        esx = beamGlowRadius;
+-        esz = beamGlowRadius;
+-        uu1 = 0.0F;
+-        uu2 = 1.0F;
+-        vv2 = -1.0F + texVOff;
+-        vv1 = height * scale + vv2;
++        float gwnx = -beamGlowRadius;
++        float gwnz = -beamGlowRadius;
++        float genx = beamGlowRadius;
++        float genz = -beamGlowRadius;
++        float gwsx = -beamGlowRadius;
++        float gwsz = beamGlowRadius;
++        float gesx = beamGlowRadius;
++        float gesz = beamGlowRadius;
++        float gvv2 = -1.0F + texVOff;
++        float gvv1 = height * scale + gvv2;
+         submitNodeCollector.submitCustomGeometry(
+             poseStack,
+             RenderTypes.beaconBeam(beamLocation, true),
+-            (pose, buffer) -> renderPart(pose, buffer, ARGB.color(32, color), beamStart, beamEnd, wnx, wnz, enx, enz, wsx, wsz, esx, esz, 0.0F, 1.0F, vv1, vv2)
++            (pose, buffer) -> renderPart(pose, buffer, ARGB.color(32, color), beamStart, beamEnd, gwnx, gwnz, genx, genz, gwsx, gwsz, gesx, gesz, 0.0F, 1.0F, gvv1, gvv2)
+         );
+         poseStack.popPose();
+     }

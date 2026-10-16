@@ -1,0 +1,124 @@
+--- a/net/minecraft/client/renderer/state/gui/GuiRenderState.java
++++ b/net/minecraft/client/renderer/state/gui/GuiRenderState.java
+@@ -1,3 +1,10 @@
++// Patched copy of the vanilla 26.3 class (round 6 G1, docs/metal/CONTRACT.md 16.G1). Differences from vanilla:
++//  - navigateToAboveHighestElementWithIntersectingBounds(): the per-node "does any element intersect" test goes through
++//    nodeIntersects(), which uses the node's GuiLayerIndex grid when GuiLayerIndex.enabled (-Dmc.gui.layerIndex, default
++//    on) and the node holds >= GuiLayerIndex.THRESHOLD intersect-tested states; same boolean as vanilla's four
++//    hasIntersection scans (proof in GuiLayerIndex). Otherwise the vanilla scans.
++//  - Node: counts its intersect-tested states and feeds a built index on every add; reset() returns the indexes to
++//    GuiLayerIndex's pool. Nothing else changes.
+ package net.minecraft.client.renderer.state.gui;
+ 
+ import com.mojang.blaze3d.platform.Window;
+@@ -130,10 +137,7 @@
+         boolean found = false;
+ 
+         while (!found) {
+-            found = this.hasIntersection(bounds, node.elementStates)
+-                || this.hasIntersection(bounds, node.itemStates)
+-                || this.hasIntersection(bounds, node.textStates)
+-                || this.hasIntersection(bounds, node.picturesInPictureStates);
++            found = this.nodeIntersects(bounds, node);
+             if (node.parent == null) {
+                 break;
+             }
+@@ -147,6 +151,27 @@
+         if (found) {
+             this.up();
+         }
++    }
++
++    private boolean nodeIntersects(final ScreenRectangle bounds, final GuiRenderState.Node node) {
++        if (GuiLayerIndex.enabled && node.tested >= GuiLayerIndex.THRESHOLD) {
++            GuiLayerIndex index = node.index;
++            if (index == null) {
++                index = GuiLayerIndex.obtain();
++                index.addAll(node.elementStates);
++                index.addAll(node.itemStates);
++                index.addAll(node.textStates);
++                index.addAll(node.picturesInPictureStates);
++                node.index = index;
++            }
++
++            return index.intersectsAny(bounds);
++        }
++
++        return this.hasIntersection(bounds, node.elementStates)
++            || this.hasIntersection(bounds, node.itemStates)
++            || this.hasIntersection(bounds, node.textStates)
++            || this.hasIntersection(bounds, node.picturesInPictureStates);
+     }
+ 
+     private boolean hasIntersection(final ScreenRectangle bounds, final @Nullable List<? extends ScreenArea> states) {
+@@ -269,6 +294,15 @@
+ 
+     public void reset() {
+         this.itemModelIdentities.clear();
++        for (GuiRenderState.Node stratum : this.strata) {
++            for (GuiRenderState.Node node = stratum; node != null; node = node.up) {
++                if (node.index != null) {
++                    node.index.release();   // G1: pooled for the next frame's nodes
++                    node.index = null;
++                }
++            }
++        }
++
+         this.strata.clear();
+         this.firstStratumAfterBlur = 2147483647;
+         this.nextStratum();
+@@ -285,6 +319,10 @@
+         public @Nullable List<GuiItemRenderState> itemStates;
+         public @Nullable List<GuiTextRenderState> textStates;
+         public @Nullable List<PictureInPictureRenderState> picturesInPictureStates;
++        /** G1: states in elementStates / itemStates / textStates / picturesInPictureStates (the intersect-tested lists). */
++        int tested;
++        /** G1: built on the first indexed query, then fed on every add. */
++        @Nullable GuiLayerIndex index;
+ 
+         private Node(final GuiRenderState.@Nullable Node parent) {
+             this.parent = parent;
+@@ -296,6 +334,10 @@
+             }
+ 
+             this.itemStates.add(itemState);
++            this.tested++;
++            if (this.index != null) {
++                this.index.add(itemState.bounds());
++            }
+         }
+ 
+         public void addText(final GuiTextRenderState textState) {
+@@ -304,6 +346,10 @@
+             }
+ 
+             this.textStates.add(textState);
++            this.tested++;
++            if (this.index != null) {
++                this.index.add(textState.bounds());
++            }
+         }
+ 
+         public void addPicturesInPictureState(final PictureInPictureRenderState picturesInPictureState) {
+@@ -312,6 +358,10 @@
+             }
+ 
+             this.picturesInPictureStates.add(picturesInPictureState);
++            this.tested++;
++            if (this.index != null) {
++                this.index.add(picturesInPictureState.bounds());
++            }
+         }
+ 
+         public void addGuiElement(final GuiElementRenderState blitState) {
+@@ -320,6 +370,10 @@
+             }
+ 
+             this.elementStates.add(blitState);
++            this.tested++;
++            if (this.index != null) {
++                this.index.add(blitState.bounds());
++            }
+         }
+ 
+         public void addGlyph(final GuiElementRenderState glyphState) {

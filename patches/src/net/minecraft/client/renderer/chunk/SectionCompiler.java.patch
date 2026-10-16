@@ -1,0 +1,229 @@
+--- a/net/minecraft/client/renderer/chunk/SectionCompiler.java
++++ b/net/minecraft/client/renderer/chunk/SectionCompiler.java
+@@ -1,10 +1,22 @@
++// Patched copy of the vanilla 26.3 class (stage-2 terrain, docs/stage2/TERRAIN-PLAN.md S0b/S1). Differences from vanilla:
++//  - after each layer is built, TerrainMeshInfo.analyze classifies its quads by facing from the written positions and
++//    records bucket planes and bounds (Results.terrainInfo); for SOLID and CUTOUT with TerrainToggles.faceBuckets on it
++//    also reorders the quads in place into the facing-bucket layout (stable: same-bucket quads keep their emission
++//    order). TRANSLUCENT is never reordered and is sorted exactly as in vanilla.
++//  - S5 (TerrainToggles.COMPACT_VERTICES): a SOLID/CUTOUT layer whose every vertex has an exact 16-byte encoding is then
++//    transcoded in place (TerrainCompact); Results.compactVertices holds the compact bytes to upload instead of the
++//    MeshData's 28-byte buffer.
++//  - S6: with TerrainToggles.cutoutFrontToBack (solidFrontToBack) the CUTOUT (SOLID) facing buckets are additionally
++//    ordered front-to-back by plane (TerrainMeshInfo).
+ package net.minecraft.client.renderer.chunk;
+ 
+ import com.mojang.blaze3d.vertex.BufferBuilder;
+ import com.mojang.blaze3d.vertex.ByteBufferBuilder;
++import com.mojang.blaze3d.vertex.DefaultVertexFormat;
+ import com.mojang.blaze3d.vertex.MeshData;
+ import com.mojang.blaze3d.vertex.VertexSorting;
+ import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
++import com.mojang.renderpearl.api.vertex.VertexFormatElement;
+ import java.util.ArrayList;
+ import java.util.EnumMap;
+ import java.util.List;
+@@ -53,7 +65,23 @@
+     public SectionCompiler.Results compile(
+         final SectionPos sectionPos, final RenderSectionRegion region, final VertexSorting vertexSorting, final SectionBufferBuilderPack builders
+     ) {
++        return this.compile(sectionPos, region, vertexSorting, builders, region instanceof LodRegion && SKIP_ENCLOSED);
++    }
++
++    /**
++     * Far terrain (LodRegion, {@code -Dmc.lod.skipEnclosed}, default true): an opaque full block with opaque full blocks on all
++     * six sides has every face culled, so it goes straight to the visibility graph without the model, the random variant and
++     * the six face checks (most of a far node's cells are buried stone). LodMesher's {@code mc.lod.skipVerify} meshes both ways
++     * and compares the bytes.
++     */
++    static final boolean SKIP_ENCLOSED = Lod.flag("mc.lod.skipEnclosed", true);
++
++    SectionCompiler.Results compile(
++        final SectionPos sectionPos, final RenderSectionRegion region, final VertexSorting vertexSorting, final SectionBufferBuilderPack builders,
++        final boolean skipEnclosed
++    ) {
+         SectionCompiler.Results results = new SectionCompiler.Results();
++        BlockPos.MutableBlockPos side = new BlockPos.MutableBlockPos();
+         BlockPos minPos = sectionPos.origin();
+         BlockPos maxPos = minPos.offset(15, 15, 15);
+         VisGraph visGraph = new VisGraph();
+@@ -71,9 +99,52 @@
+         };
+         FluidRenderer.Output fluidOutput = layerx -> this.getOrBeginLayer(startedLayers, builders, layerx);
+ 
++        int[] tops = skipEnclosed && region instanceof LodRegion lod ? lod.columnTops() : null;
++        if (tops != null && FAST_SCAN) {
++            // Far terrain: the slab's cells plus a one-cell border resolved once into a box; the enclosed test reads its
++            // neighbours there. Same cells, same order as betweenClosed (x, then y, then z), so the same output.
++            BlockState[] box = ((LodRegion)region).slabBox(minPos, tops);
++            BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
++            for (int z = 0; z < 16; z++) {
++                for (int y = 0; y < 16; y++) {
++                    for (int x = 0; x < 16; x++) {
++                        if (minPos.getY() + y > tops[z * 16 + x]) {
++                            continue;
++                        }
++                        int i = ((y + 1) * 18 + z + 1) * 18 + x + 1;
++                        BlockState blockState = box[i];
++                        if (blockState.isAir()) {
++                            continue;
++                        }
++                        pos.set(minPos.getX() + x, minPos.getY() + y, minPos.getZ() + z);
++                        if (blockState.isSolidRender() && blockState.getFluidState().isEmpty()
++                            && box[i + 1].isSolidRender() && box[i - 1].isSolidRender()
++                            && box[i + 324].isSolidRender() && box[i - 324].isSolidRender()
++                            && box[i + 18].isSolidRender() && box[i - 18].isSolidRender()) {
++                            visGraph.setOpaque(pos);
++                            continue;
++                        }
++                        this.tesselate(results, region, pos, blockState, visGraph, blockRenderer, fluidRenderer, quadOutput, opaqueQuadOutput, fluidOutput);
++                    }
++                }
++            }
++        } else
+         for (BlockPos pos : BlockPos.betweenClosed(minPos, maxPos)) {
++            if (tops != null && pos.getY() > tops[(pos.getZ() - minPos.getZ()) * 16 + pos.getX() - minPos.getX()]) {
++                continue;   // far terrain: above the column's top, air
++            }
+             BlockState blockState = region.getBlockState(pos);
+             if (!blockState.isAir()) {
++                if (skipEnclosed && blockState.isSolidRender() && blockState.getFluidState().isEmpty()
++                    && region.getBlockState(side.setWithOffset(pos, 1, 0, 0)).isSolidRender()
++                    && region.getBlockState(side.setWithOffset(pos, -1, 0, 0)).isSolidRender()
++                    && region.getBlockState(side.setWithOffset(pos, 0, 1, 0)).isSolidRender()
++                    && region.getBlockState(side.setWithOffset(pos, 0, -1, 0)).isSolidRender()
++                    && region.getBlockState(side.setWithOffset(pos, 0, 0, 1)).isSolidRender()
++                    && region.getBlockState(side.setWithOffset(pos, 0, 0, -1)).isSolidRender()) {
++                    visGraph.setOpaque(pos);
++                    continue;
++                }
+                 try {
+                     if (blockState.isSolidRender()) {
+                         visGraph.setOpaque(pos);
+@@ -117,6 +188,40 @@
+             ChunkSectionLayer layer = entry.getKey();
+             MeshData mesh = entry.getValue().build();
+             if (mesh != null) {
++                boolean frontToBack = layer == ChunkSectionLayer.CUTOUT ? TerrainToggles.cutoutFrontToBack
++                    : layer == ChunkSectionLayer.SOLID && TerrainToggles.solidFrontToBack;
++                TerrainMeshInfo info = analyzeTerrain(mesh, !layer.translucent() && TerrainToggles.faceBuckets, frontToBack);
++                if (info != null) {
++                    results.terrainInfo.put(layer, info);
++                }
++
++                if (TerrainToggles.COMPACT_VERTICES && !layer.translucent()) {
++                    MeshData.DrawState drawState = mesh.drawState();
++                    boolean block = drawState.format() == DefaultVertexFormat.BLOCK && drawState.primitiveTopology() == PrimitiveTopology.QUADS;
++                    java.nio.ByteBuffer compact = TerrainCompact.tryTranscode(layer, mesh.vertexBuffer(), drawState.vertexCount(), block);
++                    if (compact != null) {
++                        results.compactVertices.put(layer, compact);
++                    }
++                }
++
++                // Round 12 Part B (prototype, -Dmc.terrain.greedy): the greedy copy of the layer after its vanilla quads.
++                if (TerrainGreedy.BUILD && !layer.translucent() && info != null && info.bucketed() && !results.compactVertices.containsKey(layer)
++                    && mesh.drawState().format() == DefaultVertexFormat.BLOCK) {
++                    java.nio.ByteBuffer vertices = mesh.vertexBuffer();
++                    int quads = mesh.drawState().vertexCount() / 4;
++                    java.nio.ByteBuffer greedy = TerrainGreedy.merge(vertices, quads, info.slotQuadStartArray());
++                    TerrainMeshInfo greedyInfo = greedy == null ? null : TerrainMeshInfo.analyze(greedy, greedy.remaining() / 28, 28, 0, true, frontToBack);
++                    if (greedyInfo != null) {
++                        java.nio.ByteBuffer combined = java.nio.ByteBuffer.allocateDirect(quads * 4 * 28 + greedy.remaining());
++                        java.nio.ByteBuffer vanilla = vertices.duplicate();
++                        vanilla.limit(vanilla.position() + quads * 4 * 28);
++                        combined.put(vanilla).put(greedy.duplicate()).flip();
++                        info.greedy = greedyInfo;
++                        info.greedyFirstQuad = quads;
++                        results.greedyVertices.put(layer, combined);
++                    }
++                }
++
+                 if (layer == ChunkSectionLayer.TRANSLUCENT) {
+                     results.transparencyState = mesh.sortQuads(builders.buffer(layer), vertexSorting);
+                 }
+@@ -130,6 +235,73 @@
+         return results;
+     }
+ 
++    /** {@code mc.lod.fastScan} (default true): far terrain's slab box scan (compile). */
++    static final boolean FAST_SCAN = Lod.flag("mc.lod.fastScan", true);
++
++    /** One non-air block of the far-terrain scan: the loop body of compile. */
++    private void tesselate(
++        final SectionCompiler.Results results, final RenderSectionRegion region, final BlockPos pos, final BlockState blockState, final VisGraph visGraph,
++        final ModelBlockRenderer blockRenderer, final FluidRenderer fluidRenderer, final BlockQuadOutput quadOutput, final BlockQuadOutput opaqueQuadOutput,
++        final FluidRenderer.Output fluidOutput
++    ) {
++        try {
++            if (blockState.isSolidRender()) {
++                visGraph.setOpaque(pos);
++            }
++
++            if (blockState.hasBlockEntity()) {
++                BlockEntity blockEntity = region.getBlockEntity(pos);
++                if (blockEntity != null) {
++                    this.handleBlockEntity(results, blockEntity);
++                }
++            }
++
++            FluidState fluidState = blockState.getFluidState();
++            if (!fluidState.isEmpty()) {
++                fluidRenderer.tesselate(region, pos, fluidOutput, blockState, fluidState);
++            }
++
++            if (blockState.getRenderShape() == RenderShape.MODEL) {
++                blockRenderer.tesselateBlock(
++                    ModelBlockRenderer.forceOpaque(this.cutoutLeaves, blockState) ? opaqueQuadOutput : quadOutput,
++                    SectionPos.sectionRelative(pos.getX()),
++                    SectionPos.sectionRelative(pos.getY()),
++                    SectionPos.sectionRelative(pos.getZ()),
++                    region,
++                    pos,
++                    blockState,
++                    this.blockModelSet.get(blockState),
++                    blockState.getSeed(pos)
++                );
++            }
++        } catch (Throwable t) {
++            CrashReport report = CrashReport.forThrowable(t, "Tesselating block in world");
++            CrashReportCategory category = report.addCategory("Block being tesselated");
++            CrashReportCategory.populateBlockDetails(category, region, pos, blockState);
++            throw new ReportedException(report);
++        }
++    }
++
++    /**
++     * Facing buckets / bounds of one built layer (S0b/S1); reorders its quads in place when {@code reorder}, front-to-back
++     * inside each bucket when also {@code frontToBack} (S6).
++     */
++    private static @Nullable TerrainMeshInfo analyzeTerrain(final MeshData mesh, final boolean reorder, final boolean frontToBack) {
++        MeshData.DrawState drawState = mesh.drawState();
++        if (drawState.primitiveTopology() != PrimitiveTopology.QUADS || drawState.format() != DefaultVertexFormat.BLOCK) {
++            return null;
++        }
++
++        VertexFormatElement position = drawState.format().getElement("Position");
++        if (position == null) {
++            return null;
++        }
++
++        return TerrainMeshInfo.analyze(
++            mesh.vertexBuffer(), drawState.vertexCount(), drawState.format().getVertexSize(), position.offset(), reorder, reorder && frontToBack
++        );
++    }
++
+     private BufferBuilder getOrBeginLayer(
+         final Map<ChunkSectionLayer, BufferBuilder> startedLayers, final SectionBufferBuilderPack buffers, final ChunkSectionLayer layer
+     ) {
+@@ -150,6 +322,11 @@
+     public static final class Results {
+         public final List<BlockEntity> blockEntities = new ArrayList<>();
+         public final Map<ChunkSectionLayer, MeshData> renderedLayers = new EnumMap<>(ChunkSectionLayer.class);
++        public final Map<ChunkSectionLayer, TerrainMeshInfo> terrainInfo = new EnumMap<>(ChunkSectionLayer.class);
++        /** S5: the 16-byte vertex data of the layers stored compact (a view of the MeshData's buffer, valid until it closes). */
++        public final Map<ChunkSectionLayer, java.nio.ByteBuffer> compactVertices = new EnumMap<>(ChunkSectionLayer.class);
++        /** Round 12 Part B: vanilla quads followed by their greedy copy (TerrainGreedy), uploaded instead of the MeshData's buffer. */
++        public final Map<ChunkSectionLayer, java.nio.ByteBuffer> greedyVertices = new EnumMap<>(ChunkSectionLayer.class);
+         public VisibilitySet visibilitySet = new VisibilitySet();
+         public MeshData.@Nullable SortState transparencyState;
+ 

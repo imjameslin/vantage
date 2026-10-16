@@ -1,0 +1,1081 @@
+--- a/net/minecraft/client/renderer/LevelRenderer.java
++++ b/net/minecraft/client/renderer/LevelRenderer.java
+@@ -1,3 +1,22 @@
++// Patched copy of the vanilla 26.3 class (stage-2 terrain, docs/stage2/TERRAIN-PLAN.md S0/S1/S1b/S2/S7). Differences
++// from vanilla, each behind a TerrainToggles switch (vanilla behaviour when off):
++//  - setFrameProjection(): GameRenderer hands over the exact (bobbed, nausea-skewed) projection of the frame; render()
++//    builds a TerrainFrustum from it and the terrain model-view, and forgets it at the end of the frame.
++//  - extractSectionDrawGroups(): S2 drops section-layers whose bounds miss the exact frustum; S1 emits, on the MDI
++//    path, one record per merged run of facing buckets that can face the eye (TerrainRuns); S1b splits records at
++//    16383 quads for the 16-bit terrain quad index buffer; S0 counters (TerrainStats) when enabled.
++//  - prepareChunkRenders(Indirect)(): with S1b the terrain draws use the dedicated 16-bit quad index buffer (owned
++//    here, closed in close()) and no longer grow the shared sequential quad buffer.
++//  - prepareTranslucents(): passes the frame projection to the cloud renderer (S7). endFrame(): TerrainStats.endFrame().
++//  - prepareChunkRendersIndirect(): with TerrainToggles.fastDrawList (S4, render-thread CPU) the list is built by
++//    TerrainDrawList and written in bulk (prepareChunkRendersIndirectFast); same output, the vanilla-shaped code below
++//    stays for the toggle-off path, the non-MDI path and -Dmc.terrain.drawListVerify=true.
++//  - S5 compact vertices (TerrainToggles.COMPACT_VERTICES): a compact section-layer's base vertex is its heap offset / 16,
++//    and compact section-layers form their own draw groups (ChunkDrawGroup.compact / TerrainDrawList.Group.compact),
++//    drawn with the compact pipeline variants (ChunkSectionsToRender). endFrame() logs the mesh memory report every
++//    -Dmc.terrain.meshStats=N seconds (and appends it to -Dmc.terrain.meshStatsFile=<path> when set).
++//  - prepareChunkRendersIndirect(): with TerrainToggles.sortSolidSections / sortCutoutSections the SOLID / CUTOUT records
++//    are stably sorted front-to-back by the distance of their section's centre (both list builders, same order).
+ package net.minecraft.client.renderer;
+ 
+ import com.mojang.blaze3d.framegraph.FrameGraphBuilder;
+@@ -34,6 +53,7 @@
+ import it.unimi.dsi.fastutil.objects.ObjectIterator;
+ import it.unimi.dsi.fastutil.objects.ObjectListIterator;
+ import it.unimi.dsi.fastutil.objects.ReferenceArrayList;
++import java.nio.ByteBuffer;
+ import java.util.ArrayList;
+ import java.util.EnumMap;
+ import java.util.List;
+@@ -62,6 +82,13 @@
+ import net.minecraft.client.renderer.chunk.SectionCompiler;
+ import net.minecraft.client.renderer.chunk.SectionMesh;
+ import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
++import net.minecraft.client.renderer.chunk.TerrainClusters;
++import net.minecraft.client.renderer.chunk.TerrainDrawList;
++import net.minecraft.client.renderer.chunk.TerrainFrustum;
++import net.minecraft.client.renderer.chunk.TerrainMeshInfo;
++import net.minecraft.client.renderer.chunk.TerrainRuns;
++import net.minecraft.client.renderer.chunk.TerrainStats;
++import net.minecraft.client.renderer.chunk.TerrainToggles;
+ import net.minecraft.client.renderer.chunk.TranslucencyPointOfView;
+ import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
+ import net.minecraft.client.renderer.entity.state.EntityRenderState;
+@@ -85,6 +112,7 @@
+ import net.minecraft.client.resources.model.sprite.AtlasManager;
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.core.SectionPos;
++import net.minecraft.util.Mth;
+ import net.minecraft.gizmos.Gizmos;
+ import net.minecraft.gizmos.SimpleGizmoCollector;
+ import net.minecraft.resources.Identifier;
+@@ -104,6 +132,7 @@
+ import org.joml.Vector4f;
+ import org.joml.Vector4fc;
+ import org.jspecify.annotations.Nullable;
++import org.lwjgl.system.MemoryUtil;
+ 
+ public class LevelRenderer implements AutoCloseable {
+     public static final int OIT_WAVELET_RANK = 2;
+@@ -136,6 +165,30 @@
+     private final Long2ObjectLinkedOpenHashMap<TransientBlockRenderState> transientBlocks = new Long2ObjectLinkedOpenHashMap();
+     private final BlockingQueue<TransientBlockRenderState.Removal> transientBlockRemovalQueue = new LinkedBlockingQueue<>();
+     private @Nullable ViewArea viewArea;
++
++    /** Farsight (LodGpu.realReady): every render section of chunk column (cx, cz) between block y yMin (inclusive) and yMax
++     * (exclusive) has a published mesh (compiled and uploaded, or empty). False if the view area does not hold one of them. */
++    private static int mcLevelMinY(final int fallback) {
++        ClientLevel l = net.minecraft.client.Minecraft.getInstance().level;
++        return l == null ? fallback : l.getMinY();
++    }
++
++    public boolean lodRealSectionsReady(final int cx, final int cz, final int yMin, final int yMax) {
++        ViewArea area = this.viewArea;
++        if (area == null) return false;
++        int lo = Math.max(yMin, mcLevelMinY(yMin)) >> 4, hi = Math.max(lo, (yMax - 1) >> 4);
++        net.minecraft.core.BlockPos.MutableBlockPos pos = new net.minecraft.core.BlockPos.MutableBlockPos();
++        for (int sy = lo; sy <= hi; sy++) {
++            SectionRenderDispatcher.RenderSection section = area.getRenderSectionAt(pos.set(cx << 4, sy << 4, cz << 4));
++            if (section == null) return false;
++            var mesh = section.getSectionMesh();
++            if (mesh == net.minecraft.client.renderer.chunk.CompiledSectionMesh.UNCOMPILED) return false;
++            // Round 7: compiled is not drawn yet - vanilla's visible list can lag it by frames; until the section was listed
++            // with its buffers uploaded, dropping the LOD left a hole there for those frames (flashes while turning).
++            if (net.minecraft.client.renderer.chunk.Lod.realListed && mesh != net.minecraft.client.renderer.chunk.CompiledSectionMesh.EMPTY && !section.lodListed) return false;
++        }
++        return true;
++    }
+     private final RenderTarget entityOutlineTarget;
+     private final LevelTargetBundle targets = new LevelTargetBundle();
+     private @Nullable SectionRenderDispatcher sectionRenderDispatcher;
+@@ -147,6 +200,27 @@
+     private boolean usingMultiDrawIndirectForTerrain;
+     private final SimpleGizmoCollector renderThreadGizmos = new SimpleGizmoCollector();
+     private LevelRenderer.FinalizedGizmos finalizedGizmos = new LevelRenderer.FinalizedGizmos(new DrawableGizmoPrimitives(), new DrawableGizmoPrimitives());
++    // Stage-2 terrain patch state (render thread only).
++    /** Margin of the exact frustum test around the geometry bounds, in blocks (S2). */
++    private static final double TERRAIN_BOUNDS_MARGIN = 1.0 / 64.0;
++    /** Largest offset of the projection centre from the camera position accepted for S1 (sanity bound). */
++    private static final double TERRAIN_MAX_EYE_OFFSET = 4.0;
++    private static final org.slf4j.Logger TERRAIN_LOGGER = com.mojang.logging.LogUtils.getLogger();
++    private final Matrix4f frameProjection = new Matrix4f();
++    private boolean frameProjectionValid;
++    private @Nullable TerrainFrustum terrainFrustum;
++    private boolean terrainFacingEyeValid;
++    private boolean frameShortIndices;
++    /** TerrainToggles.sortSolidSections / sortCutoutSections as read for this frame's indirect list. */
++    private boolean frameSortSolidSections;
++    private boolean frameSortCutoutSections;
++    private @Nullable GpuBuffer @Nullable [] terrainQuadIndexBuffers;
++    private final int[] terrainRunScratch = new int[8];
++    /** S4 draw-list builder (TerrainToggles.fastDrawList), created on first use and reused every frame. */
++    private @Nullable TerrainDrawList terrainDrawList;
++    /** -Dmc.terrain.meshStats: time of the last mesh memory report. */
++    private long lastMeshStatsMillis;
++    private int terrainDrawListMismatches;
+ 
+     public LevelRenderer(
+         final EntityRenderDispatcher entityRenderDispatcher,
+@@ -261,6 +335,7 @@
+         }
+ 
+         Matrix4fc terrainMatrix = new Matrix4f(this.levelRenderState.cameraRenderState.viewRotationMatrix);
++        this.prepareTerrainCulling(terrainMatrix);
+         this.usingMultiDrawIndirectForTerrain = this.multiDrawIndirectAvailable && this.levelRenderState.shouldUseMultiDrawIndirectForTerrain;
+         ChunkSectionsToRender chunkSectionsToRender;
+         if (this.usingMultiDrawIndirectForTerrain) {
+@@ -301,7 +376,8 @@
+             profiler.push("uploadTerrainBuffers");
+ 
+             try {
+-                this.sectionRenderDispatcher.uploadTerrainBuffersToGpu();
++                // TASK E: = uploadTerrainBuffersToGpu() unless -Dmc.terrain.uploadBudgetKB is set (flushes while loading).
++                this.sectionRenderDispatcher.uploadTerrainBuffersForFrame(this.levelRenderState.playerCompiledSectionCallback != null);
+             } finally {
+                 this.sectionRenderDispatcher.unlock();
+             }
+@@ -320,9 +396,79 @@
+             }
+         }
+ 
++        this.frameProjectionValid = false;
++        this.terrainFrustum = null;
++        this.terrainFacingEyeValid = false;
+         RenderSystem.isRenderingLevel = false;
++    }
++
++    /**
++     * Stage-2 terrain patch: the projection matrix the level is rendered with this frame, exactly as uploaded
++     * (camera projection with hurt tilt, view bob and nausea applied). Called by {@code GameRenderer.renderLevel}
++     * right before {@link #render}; valid for that one call.
++     */
++    public void setFrameProjection(final Matrix4fc projection) {
++        this.frameProjection.set(projection);
++        this.frameProjectionValid = true;
++    }
++
++    /**
++     * Builds the frame's exact view volume (S2) and decides whether its centre of projection can drive S1: the
++     * centre must be finite and near the camera, and the transform must keep the orientation of the camera's own
++     * projection (so vanilla's front faces stay the faces whose normal points at that centre).
++     */
++    private void prepareTerrainCulling(final Matrix4fc terrainMatrix) {
++        this.terrainFrustum = null;
++        this.terrainFacingEyeValid = false;
++        if (!this.frameProjectionValid || !(TerrainToggles.exactFrustum || TerrainToggles.faceBuckets || TerrainStats.ENABLED)) {
++            return;
++        }
++
++        TerrainFrustum frustum = TerrainFrustum.of(this.frameProjection, terrainMatrix);
++        this.terrainFrustum = frustum;
++        double referenceDeterminant = TerrainFrustum.product(this.levelRenderState.cameraRenderState.projectionMatrix, terrainMatrix).determinant();
++        double ex = frustum.eyeX();
++        double ey = frustum.eyeY();
++        double ez = frustum.eyeZ();
++        this.terrainFacingEyeValid = frustum.hasEye()
++            && ex * ex + ey * ey + ez * ez <= TERRAIN_MAX_EYE_OFFSET * TERRAIN_MAX_EYE_OFFSET
++            && Double.isFinite(referenceDeterminant)
++            && referenceDeterminant != 0.0
++            && (referenceDeterminant > 0.0) == (frustum.determinant() > 0.0);
+     }
+ 
++    /** The fixed 16-bit quad index buffer of S1b, created on first use. */
++    private GpuBuffer getTerrainQuadIndexBuffer() {
++        // Round 12 (b), CONTRACT 16.R12-B: TerrainToggles#quadIndexOrder picks the triangle order inside each quad (read once
++        // per frame here, abab-switchable). Every pattern covers the same two triangles with the same winding.
++        int order = Math.floorMod(TerrainToggles.quadIndexOrder, TerrainToggles.QUAD_INDEX_PATTERNS.length);
++        if (this.terrainQuadIndexBuffers == null) {
++            this.terrainQuadIndexBuffers = new GpuBuffer[TerrainToggles.QUAD_INDEX_PATTERNS.length];
++        }
++        GpuBuffer[] buffers = this.terrainQuadIndexBuffers;
++        if (buffers[order] == null) {
++            int quads = TerrainRuns.SHORT_INDEX_QUADS;
++            int[] pattern = TerrainToggles.QUAD_INDEX_PATTERNS[order];
++            ByteBuffer data = MemoryUtil.memAlloc(quads * 6 * 2);
++
++            try {
++                for (int quad = 0; quad < quads; quad++) {
++                    int v = quad * 4;
++                    for (int i = 0; i < 6; i++) {
++                        data.putShort((short)(v + pattern[i]));
++                    }
++                }
++
++                data.flip();
++                buffers[order] = RenderSystem.getDevice().createBuffer(() -> "Terrain quad index buffer", GpuBuffer.USAGE_INDEX, data);
++            } finally {
++                MemoryUtil.memFree(data);
++            }
++        }
++
++        return buffers[order];
++    }
++
+     private void submitFeatures(final LevelRenderState levelRenderState, final SubmitNodeCollector submitNodeCollector, final boolean renderOutline) {
+         PoseStack poseStack = new PoseStack();
+         this.submitEntities(poseStack, levelRenderState, submitNodeCollector);
+@@ -377,7 +523,16 @@
+             if (state.skybox != DimensionType.Skybox.NONE) {
+                 FramePass pass = frame.addPass("sky");
+                 this.targets.main = pass.readsAndWrites(this.targets.main);
+-                pass.executes(() -> this.skyRenderer.render(skyFog, state));
++                pass.executes(() -> {
++                    if (Tessera.ENABLED) {
++                        // Stage 4 (Tessera): the frame's light block before the sky (the sky gradient reads it)
++                        this.prepareTessera(this.targets.main.get());
++                        this.tesseraPrepared = true;
++                        RenderSystem.setShaderFog(skyFog);   // the terrain fog (the main pass sets it again): the clouds fade into its colour
++                        this.tesseraCloudsLow(this.targets.main.get());
++                    }
++                    this.skyRenderer.render(skyFog, state);
++                });
+             }
+         }
+     }
+@@ -440,6 +595,17 @@
+                 this.gameRenderer.lighting().setupFor(Lighting.Entry.LEVEL);
+                 RenderTarget mainTarget = this.targets.main.get();
+ 
++                if (Tessera.ENABLED) {
++                    // Stage 4 (Tessera): terrain lightmap copy, sun shadow map and the frame's light block, before any
++                    // terrain pass (LOD reuse captures included); done by the sky pass when there is one.
++                    if (!this.tesseraPrepared) {
++                        this.prepareTessera(mainTarget);
++                        this.tesseraCloudsLow(mainTarget);
++                    }
++                    this.tesseraPrepared = false;
++                }
++                chunkSectionsToRender.prepareLodReuse(this.levelRenderState.renderWireframeTerrain, this.chunkLayerSampler,
++                    this.textureManager.getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView(), mainTarget);
+                 try (RenderPass renderPass = RenderSystem.getDevice()
+                         .createCommandEncoder()
+                         .createRenderPass(
+@@ -529,10 +695,223 @@
+         profiler.pop();
+     }
+ 
++    /** Stage 4 (Tessera): terrain lightmap copy, sun shadow casters, water inputs and the frame's light block. */
++    private boolean tesseraPrepared;
++
++    /**
++     * Stage 4: the half-resolution clouds (composited in the main pass), right after the frame's light block and before
++     * the sky / main passes, so those two stay back to back on the main target.
++     */
++    private void tesseraCloudsLow(final RenderTarget mainTarget) {
++        if (!this.gameRenderer.useImprovedTransparency() && this.optionsRenderState.cloudStatus != CloudStatus.OFF
++            && ARGB.alpha(this.levelRenderState.cloudColor) > 0) {
++            this.cloudRenderer.renderLow(mainTarget);
++        }
++    }
++
++    private void prepareTessera(final RenderTarget mainTarget) {
++        ProfilerFiller profiler = Profiler.get();
++        profiler.push("tessera");
++        Tessera tessera = Tessera.INSTANCE;
++        Matrix4f projection = this.frameProjectionValid ? this.frameProjection : this.levelRenderState.cameraRenderState.projectionMatrix;
++        Matrix4fc viewRotation = this.levelRenderState.cameraRenderState.viewRotationMatrix;
++        tessera.noteTerrainLightmap(this.gameRenderer.lightmap());
++        if (!Tessera.active) {
++            tessera.writeFrameLight(mainTarget.width, mainTarget.height, projection, viewRotation, false);
++            profiler.pop();
++            return;
++        }
++        tessera.updateTerrainLightmap(this.gameRenderer.lightmap());
++        tessera.noteTerrainLightmap(this.gameRenderer.lightmap());
++        GpuTextureView blockAtlas = this.textureManager.getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
++        GpuTextureView terrainLightmap = Tessera.terrainLightmap(this.gameRenderer.lightmap());
++        Vec3 cam = this.levelRenderState.cameraRenderState.pos;
++        Matrix4fc shadowView = tessera.prepareLight(this.levelRenderState.skyRenderState, cam.x, cam.y, cam.z);
++        if (shadowView != null) {
++            profiler.push("shadowCasters");
++            this.updateTesseraCasters();
++            if (tessera.needsShadowRender(this.tesseraCasterHash)) {
++                ChunkSectionsToRender casters = this.writeTesseraCasters(shadowView);
++                try (RenderPass pass = tessera.beginShadowPass()) {
++                    tessera.bindTerrain(pass, false);
++                    if (casters != null) {
++                        casters.renderShadowCasters(pass, this.chunkLayerSampler, blockAtlas, terrainLightmap);
++                    }
++                }
++                tessera.markShadowRendered(this.tesseraCasterHash);
++            }
++            profiler.pop();
++        }
++        tessera.prepareWater((TextureAtlas)this.textureManager.getTexture(TextureAtlas.LOCATION_BLOCKS), this.levelRenderState.skyRenderState.skyColor,
++            cam.x, cam.y, cam.z, (float)((System.nanoTime() / 1.0E9) % 3600.0));
++        tessera.writeFrameLight(mainTarget.width, mainTarget.height, projection, viewRotation, shadowView != null);
++        profiler.pop();
++    }
++
++    // Stage 4 (Tessera): the shadow caster list, rebuilt on the CPU only when a section mesh changed or the camera moved to
++    // another section; tesseraCasterHash identifies its content (an unchanged list leaves the shadow map as it is).
++    private @Nullable EnumMap<ChunkSectionLayer, List<LevelRenderer.ChunkDrawGroup>> tesseraCasterGroups;
++    private List<DynamicGpuData.ChunkSectionInfo> tesseraCasterInfos = List.of();
++    private int tesseraCasterLargestIndex;
++    private boolean tesseraCasterShortIndices;
++    private long tesseraCasterEpoch = -1L;
++    private long tesseraCasterSection = Long.MIN_VALUE;
++    private long tesseraCasterHash;
++
++    /** Stage 4 (Tessera): every compiled SOLID/CUTOUT section within Tessera.CASTER_RADIUS sections, whole (no culling). */
++    private void updateTesseraCasters() {
++        if (this.sectionRenderDispatcher == null || this.viewArea == null) {
++            this.tesseraCasterGroups = null;
++            this.tesseraCasterHash = 0L;
++            return;
++        }
++        Vec3 camNow = this.levelRenderState.cameraRenderState.pos;
++        long sectionKey = SectionPos.asLong(
++            SectionPos.blockToSectionCoord(Mth.floor(camNow.x)), SectionPos.blockToSectionCoord(Mth.floor(camNow.y)), SectionPos.blockToSectionCoord(Mth.floor(camNow.z)));
++        long epoch = SectionRenderDispatcher.meshEpoch;
++        if (this.tesseraCasterGroups != null && (!Tessera.casterUpdates || epoch == this.tesseraCasterEpoch && sectionKey == this.tesseraCasterSection
++            && this.frameShortIndices == this.tesseraCasterShortIndices)) {
++            return;
++        }
++        Tessera.casterRebuilds++;
++        this.tesseraCasterSection = sectionKey;
++        // watch only the caster box from now on (+1: sections moving in at the border)
++        SectionRenderDispatcher.watchX = SectionPos.x(sectionKey);
++        SectionRenderDispatcher.watchZ = SectionPos.z(sectionKey);
++        SectionRenderDispatcher.watchRadius = Tessera.CASTER_RADIUS + 1;
++        this.tesseraCasterEpoch = SectionRenderDispatcher.meshEpoch;
++        long contentHash = 1469598103934665603L;
++        List<DynamicGpuData.ChunkSectionInfo> sectionInfos = new ArrayList<>();
++        Int2ObjectOpenHashMap<LevelRenderer.ChunkDrawGroup> groupCache = new Int2ObjectOpenHashMap<>();
++        EnumMap<ChunkSectionLayer, List<LevelRenderer.ChunkDrawGroup>> groups = new EnumMap<>(ChunkSectionLayer.class);
++        for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
++            groups.put(layer, new ArrayList<>());
++        }
++        boolean shortIndices = this.frameShortIndices;
++        int maxQuadsPerDraw = shortIndices ? TerrainRuns.SHORT_INDEX_QUADS : TerrainRuns.NO_SPLIT;
++        int largestIndexCount = 0;
++        Vec3 cam = this.levelRenderState.cameraRenderState.pos;
++        int cx = SectionPos.blockToSectionCoord(Mth.floor(cam.x));
++        int cy = SectionPos.blockToSectionCoord(Mth.floor(cam.y));
++        int cz = SectionPos.blockToSectionCoord(Mth.floor(cam.z));
++        int r = Tessera.CASTER_RADIUS;
++        int minY = Math.max(this.viewArea.minSectionY(), cy - r);
++        int maxY = Math.min(this.viewArea.maxSectionY(), cy + r);
++        BlockPos.MutableBlockPos probe = new BlockPos.MutableBlockPos();
++        this.sectionRenderDispatcher.lock();
++        try {
++            for (int sx = cx - r; sx <= cx + r; sx++) {
++                for (int sz = cz - r; sz <= cz + r; sz++) {
++                    for (int sy = minY; sy <= maxY; sy++) {
++                        probe.set(SectionPos.sectionToBlockCoord(sx), SectionPos.sectionToBlockCoord(sy), SectionPos.sectionToBlockCoord(sz));
++                        SectionRenderDispatcher.RenderSection section = this.viewArea.getRenderSectionAt(probe);
++                        if (section == null || !section.getRenderOrigin().equals(probe)) {
++                            continue;
++                        }
++                        SectionMesh mesh = section.getSectionMesh();
++                        int infoIndex = -1;
++                        for (ChunkSectionLayer layer : new ChunkSectionLayer[]{ChunkSectionLayer.SOLID, ChunkSectionLayer.CUTOUT}) {
++                            SectionMesh.SectionDraw draw = mesh.getSectionDraw(layer);
++                            if (draw == null) {
++                                continue;
++                            }
++                            SectionRenderDispatcher.RenderSectionBufferSlice slice = this.sectionRenderDispatcher.getRenderSectionSlice(mesh, layer);
++                            if (slice == null || draw.hasCustomIndexBuffer() && slice.indexBuffer() == null) {
++                                continue;
++                            }
++                            if (infoIndex == -1) {
++                                infoIndex = sectionInfos.size();
++                                sectionInfos.add(new DynamicGpuData.ChunkSectionInfo(probe.getX(), probe.getY(), probe.getZ(), 1.0F));
++                            }
++                            VertexFormat vertexFormat = layer.pipeline(false).getVertexFormatBinding(0);
++                            GpuBuffer vertexBuffer = slice.vertexBuffer();
++                            int hash = 31 * (31 * 173 + vertexBuffer.hashCode()) + (draw.compact() ? 0x5C0 : 0) + layer.ordinal() * 7919;
++                            int firstIndex = 0;
++                            GpuBuffer indexBuffer = null;
++                            IndexType indexType = null;
++                            if (!draw.hasCustomIndexBuffer()) {
++                                largestIndexCount = Math.max(largestIndexCount, draw.indexCount());
++                            } else {
++                                indexBuffer = slice.indexBuffer();
++                                indexType = draw.indexType();
++                                hash = 31 * (31 * hash + indexBuffer.hashCode()) + indexType.hashCode();
++                                firstIndex = (int)(slice.indexBufferOffset() / indexType.bytes);
++                            }
++                            int baseVertex = (int)(slice.vertexBufferOffset() / draw.vertexSize(vertexFormat.getVertexSize()));
++                            LevelRenderer.ChunkDrawGroup group = groupCache.get(hash);
++                            if (group == null) {
++                                group = new LevelRenderer.ChunkDrawGroup(
++                                    vertexBuffer.slice(), indexBuffer != null ? indexBuffer.slice() : null, indexType, new ArrayList<>(), draw.compact()
++                                );
++                                groupCache.put(hash, group);
++                                groups.get(layer).add(group);
++                            }
++                            contentHash = (contentHash ^ (System.identityHashCode(vertexBuffer) * 31L + baseVertex)) * 1099511628211L;
++                            contentHash = (contentHash ^ ((long)firstIndex << 32 | draw.indexCount())) * 1099511628211L;
++                            contentHash = (contentHash ^ probe.asLong() ^ (long)layer.ordinal() << 60) * 1099511628211L;
++                            if (draw.hasCustomIndexBuffer()) {
++                                contentHash = (contentHash ^ System.identityHashCode(indexBuffer)) * 1099511628211L;
++                                group.draws.add(new DynamicGpuData.IndexedDraw(draw.indexCount(), 1, firstIndex, baseVertex, infoIndex));
++                            } else {
++                                TerrainRuns.emitWhole(draw.indexCount() / 6, baseVertex, infoIndex, maxQuadsPerDraw, 1, group.draws);
++                            }
++                        }
++                    }
++                }
++            }
++        } finally {
++            this.sectionRenderDispatcher.unlock();
++        }
++        this.tesseraCasterGroups = groups;
++        this.tesseraCasterInfos = sectionInfos;
++        this.tesseraCasterLargestIndex = largestIndexCount;
++        this.tesseraCasterShortIndices = shortIndices;
++        this.tesseraCasterHash = contentHash ^ (shortIndices ? 0x5A5AL : 0L);
++    }
++
++    /** Stage 4 (Tessera): this frame's GPU copy of the cached caster list (indirect commands, section infos, transform). */
++    private ChunkSectionsToRender.@Nullable DrawIndirect writeTesseraCasters(final Matrix4fc shadowView) {
++        EnumMap<ChunkSectionLayer, List<LevelRenderer.ChunkDrawGroup>> groups = this.tesseraCasterGroups;
++        List<DynamicGpuData.ChunkSectionInfo> sectionInfos = this.tesseraCasterInfos;
++        if (groups == null || sectionInfos.isEmpty()) {
++            return null;
++        }
++        GpuTextureView blockAtlas = this.textureManager.getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
++        int largestIndexCount = this.tesseraCasterLargestIndex;
++        boolean shortIndices = this.tesseraCasterShortIndices;
++        List<List<DynamicGpuData.IndexedDraw>> batched = new ArrayList<>();
++        for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
++            for (LevelRenderer.ChunkDrawGroup group : groups.get(layer)) {
++                batched.add(group.draws);
++            }
++        }
++        DynamicGpuData dynamic = RenderSystem.getDynamicUniforms();
++        GpuBufferSlice[] commands = dynamic.writeChunkSectionCommands(batched);
++        EnumMap<ChunkSectionLayer, List<ChunkSectionsToRender.GpuMultiDrawIndexedIndirect>> indirect = new EnumMap<>(ChunkSectionLayer.class);
++        int k = 0;
++        for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
++            List<ChunkSectionsToRender.GpuMultiDrawIndexedIndirect> out = new ArrayList<>();
++            for (LevelRenderer.ChunkDrawGroup group : groups.get(layer)) {
++                out.add(new ChunkSectionsToRender.GpuMultiDrawIndexedIndirect(
++                    group.vertexBuffer, group.indexBuffer, group.indexType, commands[k++], group.draws.size(), group.compact));
++            }
++            indirect.put(layer, out);
++        }
++        GpuBufferSlice transform = dynamic.writeTerrainTransform(shadowView, blockAtlas.getWidth(0), blockAtlas.getHeight(0));
++        GpuBufferSlice infos = dynamic.writeChunkSectionsInstanced(sectionInfos);
++        if (largestIndexCount != 0 && !shortIndices) {
++            RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS).requestIndexCount(largestIndexCount);
++        }
++        ChunkSectionsToRender.DrawIndirect result = new ChunkSectionsToRender.DrawIndirect(transform, indirect, largestIndexCount, infos);
++        result.withTerrainQuadIndexBuffer(largestIndexCount != 0 && shortIndices ? this.getTerrainQuadIndexBuffer() : null);
++        return result;
++    }
++
+     private void prepareTranslucents() {
+         CloudStatus cloudStatus = this.optionsRenderState.cloudStatus;
+         boolean shouldRenderClouds = cloudStatus != CloudStatus.OFF && ARGB.alpha(this.levelRenderState.cloudColor) > 0;
+         if (shouldRenderClouds) {
++            this.cloudRenderer.setCullProjection(this.frameProjectionValid ? this.frameProjection : null);
+             this.cloudRenderer
+                 .prepare(
+                     this.levelRenderState.cloudColor,
+@@ -727,6 +1106,32 @@
+         int largestIndexCount = 0;
+         Int2ObjectOpenHashMap<LevelRenderer.ChunkDrawGroup> drawGroupCache = new Int2ObjectOpenHashMap();
+         if (this.sectionRenderDispatcher != null) {
++            // Stage-2 terrain patch: per-frame culling state, read once (TerrainToggles are volatile).
++            boolean stats = TerrainStats.ENABLED;
++            CameraRenderState cameraState = this.levelRenderState.cameraRenderState;
++            TerrainFrustum frustum = this.terrainFrustum;
++            // S2: skipped while a debug frustum capture is active (plan section 4.2).
++            boolean frustumCull = frustum != null && TerrainToggles.exactFrustum && !cameraState.isFrustumCaptured;
++            boolean frustumTest = frustum != null && !cameraState.isFrustumCaptured && (frustumCull || stats);
++            boolean facingEye = frustum != null && this.terrainFacingEyeValid;
++            boolean bucketCull = facingEye
++                && this.usingMultiDrawIndirectForTerrain
++                && TerrainToggles.faceBuckets
++                && !this.levelRenderState.renderWireframeTerrain;
++            boolean[] layerBucketCull = new boolean[ChunkSectionLayer.values().length];
++
++            for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
++                // Only SOLID/CUTOUT are reordered; skipped quads must be exactly the ones the pipeline culls.
++                layerBucketCull[layer.ordinal()] = bucketCull && !layer.translucent() && layer.pipeline(true).isCull();
++            }
++
++            Vec3 cameraPos = cameraState.pos;
++            double eyeX = cameraPos.x + (facingEye ? frustum.eyeX() : 0.0);
++            double eyeY = cameraPos.y + (facingEye ? frustum.eyeY() : 0.0);
++            double eyeZ = cameraPos.z + (facingEye ? frustum.eyeZ() : 0.0);
++            int maxQuadsPerDraw = this.frameShortIndices ? TerrainRuns.SHORT_INDEX_QUADS : TerrainRuns.NO_SPLIT;
++            int splitProbe = TerrainToggles.SPLIT_PROBE;
++            int bridge = TerrainToggles.BRIDGE_QUADS;
+             this.sectionRenderDispatcher.lock();
+             long fadeDuration = Util.toMillis(this.optionsRenderState.chunkSectionFadeInTime);
+             long now = Util.getMillis();
+@@ -743,6 +1148,32 @@
+ 
+                     for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
+                         SectionMesh.SectionDraw draw = sectionMesh.getSectionDraw(layer);
++                        TerrainMeshInfo info = draw != null ? draw.info() : null;
++                        if (frustumTest
++                            && info != null
++                            && info.boundsValid()
++                            && !frustum.isBoxVisible(
++                                renderOffset.getX() + (info.minX - TERRAIN_BOUNDS_MARGIN) - cameraPos.x,
++                                renderOffset.getY() + (info.minY - TERRAIN_BOUNDS_MARGIN) - cameraPos.y,
++                                renderOffset.getZ() + (info.minZ - TERRAIN_BOUNDS_MARGIN) - cameraPos.z,
++                                renderOffset.getX() + (info.maxX + TERRAIN_BOUNDS_MARGIN) - cameraPos.x,
++                                renderOffset.getY() + (info.maxY + TERRAIN_BOUNDS_MARGIN) - cameraPos.y,
++                                renderOffset.getZ() + (info.maxZ + TERRAIN_BOUNDS_MARGIN) - cameraPos.z
++                            )) {
++                            if (stats) {
++                                TerrainStats.add(TerrainStats.FRUSTUM_SKIPPABLE, info.quadCount());
++                                TerrainStats.add(TerrainStats.FRUSTUM_SKIPPABLE_LAYERS, 1L);
++                            }
++
++                            if (frustumCull) {
++                                if (stats) {
++                                    TerrainStats.add(TerrainStats.FRUSTUM_SKIPPED, info.quadCount());
++                                }
++
++                                continue;
++                            }
++                        }
++
+                         SectionRenderDispatcher.RenderSectionBufferSlice slice = this.sectionRenderDispatcher.getRenderSectionSlice(sectionMesh, layer);
+                         if (slice != null && draw != null && (!draw.hasCustomIndexBuffer() || slice.indexBuffer() != null)) {
+                             if (sectionInfoDataIndex == -1) {
+@@ -752,12 +1183,20 @@
+                                         renderOffset.getX(), renderOffset.getY(), renderOffset.getZ(), section.getVisibility(now, fadeDuration)
+                                     )
+                                 );
++                                if (stats) {
++                                    TerrainStats.add(TerrainStats.SECTIONS, 1L);
++                                }
+                             }
+ 
+                             int combinedHash = 173;
+                             VertexFormat vertexFormat = layer.pipeline(false).getVertexFormatBinding(0);
+                             GpuBuffer vertexBuffer = slice.vertexBuffer();
+                             combinedHash = 31 * combinedHash + vertexBuffer.hashCode();
++                            if (draw.compact()) {
++                                // S5: compact section-layers of a heap form their own group (vanilla hash otherwise).
++                                combinedHash = 31 * combinedHash + 0x5C0;
++                            }
++
+                             int firstIndex = 0;
+                             GpuBuffer indexBuffer;
+                             IndexType indexType;
+@@ -776,7 +1215,7 @@
+                                 firstIndex = (int)(slice.indexBufferOffset() / indexType.bytes);
+                             }
+ 
+-                            int baseVertex = (int)(slice.vertexBufferOffset() / vertexFormat.getVertexSize());
++                            int baseVertex = (int)(slice.vertexBufferOffset() / draw.vertexSize(vertexFormat.getVertexSize()));
+                             LevelRenderer.ChunkDrawGroup drawGroup = null;
+                             if (layer.translucent() && respectTranslucentOrder) {
+                                 if (combinedHash == lastTransparentGroupHash) {
+@@ -790,13 +1229,56 @@
+ 
+                             if (drawGroup == null) {
+                                 drawGroup = new LevelRenderer.ChunkDrawGroup(
+-                                    vertexBuffer.slice(), indexBuffer != null ? indexBuffer.slice() : null, indexType, new ArrayList<>()
++                                    vertexBuffer.slice(), indexBuffer != null ? indexBuffer.slice() : null, indexType, new ArrayList<>(), draw.compact()
+                                 );
+                                 drawGroupCache.put(combinedHash, drawGroup);
+                                 drawGroups.get(layer).add(drawGroup);
+                             }
+ 
+-                            drawGroup.draws.add(new DynamicGpuData.IndexedDraw(draw.indexCount(), 1, firstIndex, baseVertex, sectionInfoDataIndex));
++                            int recordsBefore = drawGroup.draws.size();
++                            int quadsDrawn;
++                            int layerIndex = layer.ordinal();
++                            int visibleMask = -1;
++                            if (info != null && facingEye && (layerBucketCull[layerIndex] || stats)) {
++                                visibleMask = info.visibleMask(
++                                    eyeX - renderOffset.getX(), eyeY - renderOffset.getY(), eyeZ - renderOffset.getZ(), TerrainRuns.EPS
++                                );
++                            }
++
++                            if (draw.hasCustomIndexBuffer()) {
++                                drawGroup.draws.add(new DynamicGpuData.IndexedDraw(draw.indexCount(), 1, firstIndex, baseVertex, sectionInfoDataIndex));
++                                quadsDrawn = draw.indexCount() / 6;
++                            } else if (layerBucketCull[layerIndex] && info != null && info.bucketed() && visibleMask != -1) {
++                                // S1: only the runs of buckets that can face the eye (index pattern from index 0, per run).
++                                quadsDrawn = TerrainRuns.emit(
++                                    info, visibleMask, bridge, baseVertex, sectionInfoDataIndex, maxQuadsPerDraw, splitProbe, this.terrainRunScratch, drawGroup.draws
++                                );
++                                if (stats) {
++                                    int wanted = info.quadCount() - info.quadsOutside(visibleMask);
++                                    TerrainStats.add(TerrainStats.FACING_SKIPPED, info.quadCount() - quadsDrawn);
++                                    TerrainStats.add(TerrainStats.BRIDGED_QUADS, quadsDrawn - wanted);
++                                }
++                            } else {
++                                quadsDrawn = TerrainRuns.emitWhole(
++                                    draw.indexCount() / 6, baseVertex, sectionInfoDataIndex, maxQuadsPerDraw, layer.translucent() ? 1 : splitProbe, drawGroup.draws
++                                );
++                                if (layer.translucent() && respectTranslucentOrder && drawGroup.draws.size() - recordsBefore > 1) {
++                                    // Translucent draw lists are replayed in reverse; keep the parts of one split draw in order.
++                                    java.util.Collections.reverse(drawGroup.draws.subList(recordsBefore, drawGroup.draws.size()));
++                                }
++                            }
++
++                            if (stats) {
++                                TerrainStats.add(layerIndex, quadsDrawn);
++                                TerrainStats.add(TerrainStats.RECORDS, drawGroup.draws.size() - recordsBefore);
++                                if (visibleMask != -1) {
++                                    TerrainStats.add(TerrainStats.FACING_SKIPPABLE_SOLID + layerIndex, info.quadsOutside(visibleMask));
++                                }
++
++                                if (!layer.translucent()) {
++                                    TerrainStats.add(TerrainStats.OPAQUE_LAYERS, 1L);
++                                }
++                            }
+                         }
+                     }
+                 }
+@@ -814,10 +1296,12 @@
+         GpuTextureView blockAtlas = this.textureManager.getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
+         int textureAtlasWidth = blockAtlas.getWidth(0);
+         int textureAtlasHeight = blockAtlas.getHeight(0);
++        this.frameShortIndices = TerrainToggles.shortIndices;
+         int largestIndexCount = this.extractSectionDrawGroups(respectTranslucentOrder, sectionInfos, drawGroups);
+         Map<ChunkSectionLayer, List<RenderPass.Draw<GpuBufferSlice[]>>> flattenDraws = Util.makeEnumMap(
+             ChunkSectionLayer.class, layerx -> new ReferenceArrayList()
+         );
++        Map<ChunkSectionLayer, List<RenderPass.Draw<GpuBufferSlice[]>>> flattenCompactDraws = null;
+ 
+         for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
+             List<LevelRenderer.ChunkDrawGroup> sortedDrawGroups = drawGroups.get(layer);
+@@ -826,7 +1310,18 @@
+             }
+ 
+             for (LevelRenderer.ChunkDrawGroup drawGroup : sortedDrawGroups) {
+-                List<RenderPass.Draw<GpuBufferSlice[]>> dest = flattenDraws.get(layer);
++                List<RenderPass.Draw<GpuBufferSlice[]>> dest;
++                if (drawGroup.compact()) {
++                    // S5: compact section-layers are drawn after the layer's 28-byte ones, with the compact pipeline.
++                    if (flattenCompactDraws == null) {
++                        flattenCompactDraws = Util.makeEnumMap(ChunkSectionLayer.class, layerx -> new ReferenceArrayList());
++                    }
++
++                    dest = flattenCompactDraws.get(layer);
++                } else {
++                    dest = flattenDraws.get(layer);
++                }
++
+                 List<DynamicGpuData.IndexedDraw> sortedDraws = drawGroup.draws;
+                 if (layer.translucent() && respectTranslucentOrder) {
+                     sortedDraws = sortedDraws.reversed();
+@@ -854,11 +1349,13 @@
+         GpuBufferSlice terrainTransformUbo = RenderSystem.getDynamicUniforms().writeTerrainTransform(modelViewMatrix, textureAtlasWidth, textureAtlasHeight);
+         GpuBufferSlice[] chunkSectionInfos = RenderSystem.getDynamicUniforms().writeChunkSections(sectionInfos.toArray(new DynamicGpuData.ChunkSectionInfo[0]));
+         RenderSystem.AutoStorageIndexBuffer autoIndices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
+-        if (largestIndexCount != 0) {
++        if (largestIndexCount != 0 && !this.frameShortIndices) {
+             autoIndices.requestIndexCount(largestIndexCount);
+         }
+ 
+-        return new ChunkSectionsToRender.DrawSeparate(terrainTransformUbo, flattenDraws, largestIndexCount, chunkSectionInfos);
++        return new ChunkSectionsToRender.DrawSeparate(terrainTransformUbo, flattenDraws, largestIndexCount, chunkSectionInfos)
++            .withCompactDraws(flattenCompactDraws)
++            .withTerrainQuadIndexBuffer(largestIndexCount != 0 && this.frameShortIndices ? this.getTerrainQuadIndexBuffer() : null);
+     }
+ 
+     public void addTransientBlock(final long blockNode, final TransientBlockRenderState state) {
+@@ -897,6 +1394,10 @@
+     }
+ 
+     public ChunkSectionsToRender prepareChunkRendersIndirect(final Matrix4fc modelViewMatrix, final boolean respectTranslucentOrder) {
++        if (TerrainToggles.fastDrawList && this.sectionRenderDispatcher != null) {
++            return this.prepareChunkRendersIndirectFast(modelViewMatrix, respectTranslucentOrder);
++        }
++
+         EnumMap<ChunkSectionLayer, List<LevelRenderer.ChunkDrawGroup>> drawGroups = new EnumMap<>(ChunkSectionLayer.class);
+ 
+         for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
+@@ -907,7 +1408,11 @@
+         GpuTextureView blockAtlas = this.textureManager.getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
+         int textureAtlasWidth = blockAtlas.getWidth(0);
+         int textureAtlasHeight = blockAtlas.getHeight(0);
++        this.frameShortIndices = TerrainToggles.shortIndices;
++        this.frameSortSolidSections = TerrainToggles.sortSolidSections;
++        this.frameSortCutoutSections = TerrainToggles.sortCutoutSections;
+         int largestIndexCount = this.extractSectionDrawGroups(respectTranslucentOrder, sectionInfos, drawGroups);
++        this.sortOpaqueSectionDraws(drawGroups, sectionInfos);
+         EnumMap<ChunkSectionLayer, List<ChunkSectionsToRender.GpuMultiDrawIndexedIndirect>> indirectDraws = new EnumMap<>(ChunkSectionLayer.class);
+ 
+         for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
+@@ -947,7 +1452,7 @@
+                 indirectDraws.get(layer)
+                     .add(
+                         new ChunkSectionsToRender.GpuMultiDrawIndexedIndirect(
+-                            chunkDrawGroup.vertexBuffer, chunkDrawGroup.indexBuffer, chunkDrawGroup.indexType, indirectBuffer, draws.size()
++                            chunkDrawGroup.vertexBuffer, chunkDrawGroup.indexBuffer, chunkDrawGroup.indexType, indirectBuffer, draws.size(), chunkDrawGroup.compact
+                         )
+                     );
+             }
+@@ -956,13 +1461,271 @@
+         GpuBufferSlice terrainTransformUbo = RenderSystem.getDynamicUniforms().writeTerrainTransform(modelViewMatrix, textureAtlasWidth, textureAtlasHeight);
+         GpuBufferSlice chunkSectionInfos = RenderSystem.getDynamicUniforms().writeChunkSectionsInstanced(sectionInfos);
+         RenderSystem.AutoStorageIndexBuffer autoIndices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
+-        if (largestIndexCount != 0) {
++        if (largestIndexCount != 0 && !this.frameShortIndices) {
+             autoIndices.requestIndexCount(largestIndexCount);
+         }
+ 
+-        return new ChunkSectionsToRender.DrawIndirect(terrainTransformUbo, indirectDraws, largestIndexCount, chunkSectionInfos);
++        return new ChunkSectionsToRender.DrawIndirect(terrainTransformUbo, indirectDraws, largestIndexCount, chunkSectionInfos)
++            .withTerrainQuadIndexBuffer(largestIndexCount != 0 && this.frameShortIndices ? this.getTerrainQuadIndexBuffer() : null);
+     }
+ 
++    /**
++     * S4 (TerrainToggles.fastDrawList): {@link #prepareChunkRendersIndirect} through {@link TerrainDrawList}. Same groups in
++     * the same order, same records, section infos, ring offsets and bytes, same DynamicGpuData call order as the vanilla
++     * path; only the intermediate representation differs (see TerrainDrawList).
++     */
++    private ChunkSectionsToRender prepareChunkRendersIndirectFast(final Matrix4fc modelViewMatrix, final boolean respectTranslucentOrder) {
++        GpuTextureView blockAtlas = this.textureManager.getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
++        int textureAtlasWidth = blockAtlas.getWidth(0);
++        int textureAtlasHeight = blockAtlas.getHeight(0);
++        this.frameShortIndices = TerrainToggles.shortIndices;
++        this.frameSortSolidSections = TerrainToggles.sortSolidSections;
++        this.frameSortCutoutSections = TerrainToggles.sortCutoutSections;
++        TerrainDrawList list = this.terrainDrawList;
++        if (list == null) {
++            list = new TerrainDrawList();
++            this.terrainDrawList = list;
++        }
++
++        // Round 12 (a): SOLID / CUTOUT layers with clusters go through the GPU cull (TerrainClusters), read once per frame.
++        boolean clusters = TerrainClusters.enabled && !TerrainToggles.drawListVerify && this.terrainClusterFrame().usable();
++        list.setClusterPath(clusters);
++        int largestIndexCount = this.buildTerrainDrawList(list, respectTranslucentOrder);
++        if (TerrainToggles.drawListVerify) {
++            this.verifyTerrainDrawList(list, respectTranslucentOrder, largestIndexCount);
++        }
++
++        DynamicGpuData dynamicUniforms = RenderSystem.getDynamicUniforms();
++        int groupCount = list.outputGroupCount();
++        GpuBufferSlice[] indirectBufferSlices = dynamicUniforms.writeChunkSectionCommandsRaw(list.outputCounts(), groupCount, list.recordWriter());
++        EnumMap<ChunkSectionLayer, List<ChunkSectionsToRender.GpuMultiDrawIndexedIndirect>> indirectDraws = new EnumMap<>(ChunkSectionLayer.class);
++        ChunkSectionLayer[] layers = ChunkSectionLayer.values();
++
++        for (ChunkSectionLayer layer : layers) {
++            indirectDraws.put(layer, new ArrayList<>());
++        }
++
++        for (int k = 0; k < groupCount; k++) {
++            TerrainDrawList.Group group = list.outputGroup(k);
++            indirectDraws.get(layers[group.layer()])
++                .add(
++                    new ChunkSectionsToRender.GpuMultiDrawIndexedIndirect(
++                        group.vertexSlice(), group.indexSlice(), group.indexType(), indirectBufferSlices[k], group.recordCount(), group.compact(), group.greedy()
++                    )
++                );
++        }
++
++        GpuBufferSlice terrainTransformUbo = dynamicUniforms.writeTerrainTransform(modelViewMatrix, textureAtlasWidth, textureAtlasHeight);
++        GpuBufferSlice chunkSectionInfos = dynamicUniforms.writeChunkSectionsInstancedRaw(list.sectionCount(), list.sectionWriter());
++        RenderSystem.AutoStorageIndexBuffer autoIndices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
++        if (largestIndexCount != 0 && !this.frameShortIndices) {
++            autoIndices.requestIndexCount(largestIndexCount);
++        }
++
++        List<TerrainClusters.Draw> clusterDraws = null;
++        if (clusters && !list.clusterGroups().isEmpty()) {
++            Vec3 cameraPos = this.levelRenderState.cameraRenderState.pos;
++            clusterDraws = this.terrainClusterFrame().dispatch(list.clusterGroups(), list.sectionCount(), list.sectionDataArray(), list.framePlanes(), this.frameClusterFrustum, cameraPos.x, cameraPos.y,
++                cameraPos.z, this.frameEyeX, this.frameEyeY, this.frameEyeZ);
++            if (clusterDraws == null) {
++                TerrainClusters.enabled = false;
++            }
++        }
++
++        ChunkSectionsToRender.DrawIndirect result = new ChunkSectionsToRender.DrawIndirect(terrainTransformUbo, indirectDraws, largestIndexCount, chunkSectionInfos)
++            .withClusterDraws(clusterDraws);
++        if (net.minecraft.client.renderer.chunk.Lod.BUILD) {
++            // Stage 3 (docs/stage3/LOD-DESIGN.md): far terrain beyond the real render distance through the cluster path.
++            Vec3 lodCamera = this.levelRenderState.cameraRenderState.pos;
++            net.minecraft.client.renderer.chunk.Lod.prepareFrame(result, this.terrainFrustum != null ? list.framePlanes() : null, this.terrainFrustum != null,
++                lodCamera.x, lodCamera.y, lodCamera.z, this.frameEyeX, this.frameEyeY, this.frameEyeZ, this.levelRenderState.cameraRenderState.projectionMatrix.m11());
++        }
++        return result.withTerrainQuadIndexBuffer(largestIndexCount != 0 && this.frameShortIndices ? this.getTerrainQuadIndexBuffer() : null);
++    }
++
++    private TerrainClusters.@Nullable Frame terrainClusters;
++    private double frameEyeX;
++    private double frameEyeY;
++    private double frameEyeZ;
++    private boolean frameClusterFrustum;
++
++    private TerrainClusters.Frame terrainClusterFrame() {
++        if (this.terrainClusters == null) {
++            this.terrainClusters = new TerrainClusters.Frame();
++        }
++        return this.terrainClusters;
++    }
++
++    /** The frame state of {@link #extractSectionDrawGroups}'s preamble, handed to {@link TerrainDrawList#build}. */
++    private int buildTerrainDrawList(final TerrainDrawList list, final boolean respectTranslucentOrder) {
++        boolean stats = TerrainStats.ENABLED;
++        CameraRenderState cameraState = this.levelRenderState.cameraRenderState;
++        TerrainFrustum frustum = this.terrainFrustum;
++        boolean frustumCull = frustum != null && TerrainToggles.exactFrustum && !cameraState.isFrustumCaptured;
++        boolean frustumTest = frustum != null && !cameraState.isFrustumCaptured && (frustumCull || stats);
++        boolean facingEye = frustum != null && this.terrainFacingEyeValid;
++        boolean bucketCull = facingEye
++            && this.usingMultiDrawIndirectForTerrain
++            && TerrainToggles.faceBuckets
++            && !this.levelRenderState.renderWireframeTerrain;
++        Vec3 cameraPos = cameraState.pos;
++        double eyeX = cameraPos.x + (facingEye ? frustum.eyeX() : 0.0);
++        double eyeY = cameraPos.y + (facingEye ? frustum.eyeY() : 0.0);
++        double eyeZ = cameraPos.z + (facingEye ? frustum.eyeZ() : 0.0);
++        int maxQuadsPerDraw = this.frameShortIndices ? TerrainRuns.SHORT_INDEX_QUADS : TerrainRuns.NO_SPLIT;
++        this.frameEyeX = eyeX;
++        this.frameEyeY = eyeY;
++        this.frameEyeZ = eyeZ;
++        this.frameClusterFrustum = frustumCull;
++        this.sectionRenderDispatcher.lock();
++
++        try {
++            long fadeDuration = Util.toMillis(this.optionsRenderState.chunkSectionFadeInTime);
++            long now = Util.getMillis();
++            list.begin(
++                respectTranslucentOrder,
++                frustum,
++                frustumCull,
++                frustumTest,
++                facingEye,
++                bucketCull,
++                cameraPos.x,
++                cameraPos.y,
++                cameraPos.z,
++                eyeX,
++                eyeY,
++                eyeZ,
++                maxQuadsPerDraw,
++                TerrainToggles.SPLIT_PROBE,
++                TerrainToggles.BRIDGE_QUADS,
++                now,
++                fadeDuration,
++                stats,
++                TERRAIN_BOUNDS_MARGIN,
++                this.frameSortSolidSections,
++                this.frameSortCutoutSections
++            );
++            return list.build(this.visibleSections, this.sectionRenderDispatcher);
++        } finally {
++            this.sectionRenderDispatcher.unlock();
++        }
++    }
++
++    /**
++     * Front-to-back section order of the SOLID / CUTOUT records of a vanilla-shaped list (this frame's
++     * {@code frameSortSolidSections} / {@code frameSortCutoutSections}): the same order as {@link TerrainDrawList}'s.
++     * TRANSLUCENT keeps vanilla's order (its blend order).
++     */
++    private void sortOpaqueSectionDraws(
++        final EnumMap<ChunkSectionLayer, List<LevelRenderer.ChunkDrawGroup>> drawGroups, final List<DynamicGpuData.ChunkSectionInfo> sectionInfos
++    ) {
++        if (!this.frameSortSolidSections && !this.frameSortCutoutSections) {
++            return;
++        }
++
++        Vec3 cameraPos = this.levelRenderState.cameraRenderState.pos;
++
++        for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
++            boolean sort = layer == ChunkSectionLayer.SOLID ? this.frameSortSolidSections : layer == ChunkSectionLayer.CUTOUT && this.frameSortCutoutSections;
++            if (sort) {
++                for (LevelRenderer.ChunkDrawGroup group : drawGroups.get(layer)) {
++                    TerrainDrawList.sortBySectionDistance(group.draws(), sectionInfos, cameraPos.x, cameraPos.y, cameraPos.z);
++                }
++            }
++        }
++    }
++
++    /**
++     * {@code -Dmc.terrain.drawListVerify=true}: rebuilds the frame's list with the vanilla code and logs the first
++     * differences from the fast list (groups, buffers, records in written order, section infos, largest index count).
++     * Section visibility is only compared outside fade-ins (the two builds read the clock separately).
++     */
++    private void verifyTerrainDrawList(final TerrainDrawList list, final boolean respectTranslucentOrder, final int largestIndexCount) {
++        EnumMap<ChunkSectionLayer, List<LevelRenderer.ChunkDrawGroup>> drawGroups = new EnumMap<>(ChunkSectionLayer.class);
++
++        for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
++            drawGroups.put(layer, new ReferenceArrayList());
++        }
++
++        List<DynamicGpuData.ChunkSectionInfo> sectionInfos = new ArrayList<>();
++        int vanillaLargest = this.extractSectionDrawGroups(respectTranslucentOrder, sectionInfos, drawGroups);
++        this.sortOpaqueSectionDraws(drawGroups, sectionInfos);
++        String problem = null;
++        if (vanillaLargest != largestIndexCount) {
++            problem = "largestIndexCount " + vanillaLargest + " vs " + largestIndexCount;
++        } else if (sectionInfos.size() != list.sectionCount()) {
++            problem = "section count " + sectionInfos.size() + " vs " + list.sectionCount();
++        }
++
++        for (int i = 0; problem == null && i < sectionInfos.size(); i++) {
++            DynamicGpuData.ChunkSectionInfo info = sectionInfos.get(i);
++            float visibility = Float.intBitsToFloat(list.sectionField(i, 3));
++            boolean fading = info.visibility() < 1.0F || visibility < 1.0F;
++            if (info.x() != list.sectionField(i, 0)
++                || info.y() != list.sectionField(i, 1)
++                || info.z() != list.sectionField(i, 2)
++                || !fading && Float.floatToRawIntBits(info.visibility()) != list.sectionField(i, 3)) {
++                problem = "section info " + i + ": " + info + " vs " + list.sectionField(i, 0) + "," + list.sectionField(i, 1) + "," + list.sectionField(i, 2)
++                    + " " + visibility;
++            }
++        }
++
++        int k = 0;
++
++        for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
++            boolean reverse = layer.translucent() && respectTranslucentOrder;
++            List<LevelRenderer.ChunkDrawGroup> groups = drawGroups.get(layer);
++            if (reverse) {
++                groups = groups.reversed();
++            }
++
++            for (LevelRenderer.ChunkDrawGroup group : groups) {
++                if (problem != null) {
++                    break;
++                }
++
++                if (k >= list.outputGroupCount()) {
++                    problem = "missing group " + k + " (" + layer + ")";
++                    break;
++                }
++
++                TerrainDrawList.Group fast = list.outputGroup(k);
++                List<DynamicGpuData.IndexedDraw> draws = reverse ? group.draws().reversed() : group.draws();
++                if (fast.layer() != layer.ordinal()
++                    || fast.vertexSlice().buffer() != group.vertexBuffer().buffer()
++                    || (fast.indexSlice() == null ? group.indexBuffer() != null : group.indexBuffer() == null || fast.indexSlice().buffer() != group.indexBuffer().buffer())
++                    || fast.indexType() != group.indexType()
++                    || fast.compact() != group.compact()
++                    || fast.recordCount() != draws.size()) {
++                    problem = "group " + k + " (" + layer + "): buffers/type/format/count differ (" + fast.recordCount() + " vs " + draws.size() + " records)";
++                    break;
++                }
++
++                for (int r = 0; r < draws.size(); r++) {
++                    DynamicGpuData.IndexedDraw d = draws.get(r);
++                    if (d.indexCount() != list.outputRecordField(k, r, 0)
++                        || d.instanceCount() != list.outputRecordField(k, r, 1)
++                        || d.firstIndex() != list.outputRecordField(k, r, 2)
++                        || d.baseVertex() != list.outputRecordField(k, r, 3)
++                        || d.baseInstance() != list.outputRecordField(k, r, 4)) {
++                        problem = "group " + k + " (" + layer + ") record " + r + ": " + d;
++                        break;
++                    }
++                }
++
++                k++;
++            }
++        }
++
++        if (problem == null && k != list.outputGroupCount()) {
++            problem = "extra groups: " + list.outputGroupCount() + " vs " + k;
++        }
++
++        if (problem != null && this.terrainDrawListMismatches++ < 20) {
++            TERRAIN_LOGGER.error("Terrain draw list mismatch (fast vs vanilla): {}", problem);
++        }
++    }
++
+     private void compileSections(final CameraRenderState camera) {
+         ProfilerFiller profiler = Profiler.get();
+         profiler.push("populateSectionsToCompile");
+@@ -980,6 +1743,14 @@
+             }
+ 
+             SectionRenderDispatcher.RenderSection section = this.viewArea.getRenderSection(state.sectionNode());
++            if (net.minecraft.client.renderer.chunk.ChunkStats.ENABLED && section != null) {
++                // Stage-2 W0b: which dirty sources this compile serves (ChunkStats; counting only).
++                section.statsSources = net.minecraft.client.renderer.chunk.ChunkStats.takePending(state.sectionNode());
++                net.minecraft.client.renderer.chunk.ChunkStats.scheduled(
++                    section.statsSources, section.sectionMesh.get() != net.minecraft.client.renderer.chunk.CompiledSectionMesh.UNCOMPILED, rebuildSync
++                );
++            }
++
+             if (rebuildSync) {
+                 profiler.push("compileSectionSynchronously");
+                 section.compileSync(state.region());
+@@ -1150,12 +1921,47 @@
+ 
+     public void endFrame() {
+         this.cloudRenderer.endFrame();
++        if (TerrainStats.ENABLED) {
++            TerrainStats.endFrame();
++        }
++
++        if (TerrainToggles.MESH_STATS_SECONDS > 0 && this.sectionRenderDispatcher != null) {
++            long now = Util.getMillis();
++            if (now - this.lastMeshStatsMillis >= TerrainToggles.MESH_STATS_SECONDS * 1000L) {
++                this.lastMeshStatsMillis = now;
++                String report = this.sectionRenderDispatcher.meshMemoryReport();
++                TERRAIN_LOGGER.info("{}", report);
++                if (TerrainToggles.MESH_STATS_FILE != null) {
++                    // Own file as well: the game dir's logs are shared with other runs of the harness.
++                    try {
++                        java.nio.file.Files.writeString(
++                            java.nio.file.Path.of(TerrainToggles.MESH_STATS_FILE), "t=" + now + " " + report + System.lineSeparator(),
++                            java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND
++                        );
++                    } catch (java.io.IOException e) {
++                        TERRAIN_LOGGER.warn("mesh stats file: {}", e.toString());
++                    }
++                }
++            }
++        }
+     }
+ 
+     @Override
+     public void close() {
+         this.resetLevelRenderData();
+         this.entityOutlineTarget.destroyBuffers();
++        if (this.terrainClusters != null) {
++            this.terrainClusters.close();
++            this.terrainClusters = null;
++        }
++
++        for (int i = 0; this.terrainQuadIndexBuffers != null && i < this.terrainQuadIndexBuffers.length; i++) {
++            if (this.terrainQuadIndexBuffers[i] != null) {
++                this.terrainQuadIndexBuffers[i].close();
++                this.terrainQuadIndexBuffers[i] = null;
++            }
++        }
++
+         if (this.skyRenderer != null) {
+             this.skyRenderer.close();
+         }
+@@ -1177,6 +1983,7 @@
+     }
+ 
+     public void invalidateCompiledGeometry(final ClientLevel level, final Options options, final Camera camera, final BlockColors blockColors) {
++        net.minecraft.client.renderer.chunk.Lod.invalidateMeshes();
+         SectionCompiler sectionCompiler = new SectionCompiler(
+             options.ambientOcclusion().get(),
+             options.cutoutLeaves().get(),
+@@ -1212,6 +2019,10 @@
+         this.clearVisibleSections();
+         SectionPos cameraSectionPos = SectionPos.of(camera.position());
+         this.viewArea.repositionCamera(cameraSectionPos);
++        if (net.minecraft.client.renderer.chunk.TravelHitchToggles.PREGROW) {
++            // TASK E: size the indirect-draw storages for this render distance now, not by doubling inside a frame.
++            RenderSystem.getDynamicUniforms().presizeChunkSections(options.getEffectiveRenderDistance());
++        }
+     }
+ 
+     private void scheduleTranslucentSectionResort(final Vec3 cameraPos) {
+@@ -1364,7 +2175,7 @@
+     }
+ 
+     private record ChunkDrawGroup(
+-        GpuBufferSlice vertexBuffer, @Nullable GpuBufferSlice indexBuffer, @Nullable IndexType indexType, List<DynamicGpuData.IndexedDraw> draws
++        GpuBufferSlice vertexBuffer, @Nullable GpuBufferSlice indexBuffer, @Nullable IndexType indexType, List<DynamicGpuData.IndexedDraw> draws, boolean compact
+     ) {
+     }
+ 

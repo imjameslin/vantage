@@ -1,0 +1,66 @@
+--- a/assets/minecraft/shaders/core/particle.fsh
++++ b/assets/minecraft/shaders/core/particle.fsh
+@@ -1,9 +1,14 @@
+ #version 330
+ #extension GL_ARB_separate_shader_objects : require
++#extension GL_ARB_texture_gather : enable
+ 
+ #include <minecraft:fog.glsl>
+ #include <minecraft:dynamictransforms.glsl>
+ #include <minecraft:oit.glsl>
++#if defined(TESSERA) && !defined(TESSERA_WEATHER) && !defined(OIT_ALPHA_ONLY)
++#define TESSERA_PARTICLE
++#include <minecraft:tessera.glsl>
++#endif
+ 
+ uniform sampler2D Sampler0;
+ 
+@@ -11,6 +16,11 @@
+ layout(location = 1) in float cylindricalVertexDistance;
+ layout(location = 2) in vec2 texCoord0;
+ layout(location = 3) in vec4 vertexColor;
++#ifdef TESSERA_PARTICLE
++layout(location = 8) in vec3 tesseraP;
++layout(location = 10) in vec2 tesseraLm;
++layout(location = 11) in vec4 tesseraBase;
++#endif
+ 
+ #ifndef OIT_ALPHA_ONLY
+ layout(location = 0) out vec4 fragColor;
+@@ -28,9 +38,36 @@
+ 
+ void main() {
+     vec4 color = texture(Sampler0, texCoord0) * vertexColor * ColorModulator;
++#ifdef TESSERA_WEATHER
++    // Stage 4 (Tessera): rain (the blue texture) as faint pale-grey streaks lit like the air around them (the vertex
++    // colour carries vanilla's light); snow (white) as vanilla draws it
++    vec4 tex = texture(Sampler0, texCoord0);
++    if (tex.r + tex.g < 1.5) {
++        float light = dot(vertexColor.rgb, vec3(0.2126, 0.7152, 0.0722));
++        color.rgb = vec3(0.80, 0.84, 0.90) * (0.35 + 0.65 * dot(tex.rgb, vec3(0.3333))) * light;
++    }
++#endif
+     if (color.a < 0.1) {
+         discard;
+     }
++#ifdef TESSERA_PARTICLE
++    // Stage 4 (Tessera): during the level render lit like the terrain (lit like plants, as if facing the sky: sun / moon through the
++    // shadow map, sky ambient, block light) and tonemapped; full-bright particles (flames, lava) get full block light
++    if (TesseraSkyColor.w != 0.0) {
++        vec4 albedo = texture(Sampler0, texCoord0) * tesseraBase * ColorModulator;
++        float tesseraLit;
++        vec3 tesseraL = tesseraTerrainLight(tesseraP, vec3(0.0, 1.0, 0.0), tesseraLm, 1.0, tesseraLit);
++        // lava drips / sparks (orange) glow; soft translucent smoke (campfires) is thinner
++        if (albedo.r > 0.83 && albedo.g > 0.23 && albedo.b < 0.4) tesseraL += 1.4;
++        else if (color.a < 0.99 && dot(albedo.rgb, albedo.rgb) < 1.0) color.a *= 0.5;
++        color.rgb = tesseraTonemap(tesseraLinear(albedo.rgb * tesseraL));
++    }
++#endif
++#ifdef TESSERA_WEATHER
++    if (texture(Sampler0, texCoord0).r + texture(Sampler0, texCoord0).g < 1.5) {
++        color.a *= 0.35;
++    }
++#endif
+     #ifdef OIT_ALPHA_ONLY
+     executeAlphaOnlyPhase(gl_FragCoord.z, color.a);
+     #else

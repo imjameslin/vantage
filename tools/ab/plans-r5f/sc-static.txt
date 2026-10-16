@@ -1,0 +1,14 @@
+# Release scorecard, static (RD 12): client-r5.jar vs client-r4.jar at shipped defaults, 4+4 ABBA, plus vanilla 26.3
+# Vulkan and OpenGL x2 each in the same session (same overlay state) for the GOAL bars. tools/ab/scorecard.py, MEMLOG=1.
+static r5f-sc-st-r5-1 r5
+static r5f-sc-st-r4-1 r4
+static r5f-sc-st-vk-1 vk
+static r5f-sc-st-gl-1 gl
+static r5f-sc-st-r4-2 r4
+static r5f-sc-st-r5-2 r5
+static r5f-sc-st-r5-3 r5
+static r5f-sc-st-r4-3 r4
+static r5f-sc-st-gl-2 gl
+static r5f-sc-st-vk-2 vk
+static r5f-sc-st-r4-4 r4
+static r5f-sc-st-r5-4 r5

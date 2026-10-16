@@ -1,0 +1,18 @@
+# Second validation of mode=abab after the review (results/ABAB.md): new statistics (whole-pair 1 % / 0.1 % low, Holm
+# over the primary family, p-values), the balanced look schedule with repeated intervals, per-arm presentation counts,
+# and the new default design segments=8. Client build/client-abab.jar (main + W1 + switchable tick toggles), bench
+# ABAB_BENCH_JAR=build/bench-abab4.jar. Runner: game-dir lock, checks after the GPU-lock wait, load during the run.
+# 0. Smoke run of the new jar: 4 blocks, stop on with a primary, a pair and a GPU stop metric (every code path).
+abab abab-smoke4 build/client-abab.jar --bench-prop abab.toggles=bench.Abab#aaNoop=0|1 --bench-prop abab.blocks=4 --bench-prop abab.stop=true --bench-prop abab.stopOn=median2,pairP99,gpuMedian --bench-prop abab.minPairs=2
+# 1. A/A, default design (segments 8), 3 launches.
+abab abab-aa8-1 build/client-abab.jar --bench-prop abab.toggles=bench.Abab#aaNoop=0|1
+abab abab-aa8-2 build/client-abab.jar --bench-prop abab.toggles=bench.Abab#aaNoop=0|1
+abab abab-aa8-3 build/client-abab.jar --bench-prop abab.toggles=bench.Abab#aaNoop=0|1
+# 2. W1 sensitivity, default design, 2 launches (with w1ab-s8-1/2: 4 launches at segments 8), then the sequential stop.
+abab w1ab-s8-3 build/client-abab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20
+abab w1ab-s8-4 build/client-abab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20
+abab w1ab-stop8-1 build/client-abab.jar --bench-prop abab.toggles=net.minecraft.client.gui.HudVignetteSkip#enabled=false|true --bench-prop warmup=20 --bench-prop abab.stop=true
+# 3. Fast client tick pair: a second launch for the tail claim, and a short run with the fast path's verify on (it re-runs
+#    the vanilla lookups per position and logs any mismatch; it costs time in arm B, so it is a correctness run only).
+abab tick-ab-s8-1 build/client-abab.jar --bench-prop abab.toggles=net.minecraft.client.multiplayer.ClientLevel#FAST_ANIMATE_TICK=false|true,net.minecraft.client.renderer.texture.TextureAtlas#FAST_TEXTURE_ANIMATION=false|true
+abab tick-verify-1 build/client-abab.jar --jvm=-Dmc.fastAnimateTick.verify=true --bench-prop abab.blocks=4 --bench-prop abab.toggles=net.minecraft.client.multiplayer.ClientLevel#FAST_ANIMATE_TICK=false|true,net.minecraft.client.renderer.texture.TextureAtlas#FAST_TEXTURE_ANIMATION=false|true

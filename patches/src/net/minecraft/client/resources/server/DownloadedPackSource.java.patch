@@ -1,0 +1,24 @@
+--- a/net/minecraft/client/resources/server/DownloadedPackSource.java
++++ b/net/minecraft/client/resources/server/DownloadedPackSource.java
+@@ -1,3 +1,6 @@
++// Patched copy of the vanilla 26.3 class (stage-2 W7, docs/metal/CONTRACT.md 16.W7). Difference from vanilla: the read-only
++// accessor serverPackReloadPending(), which the patched LoadingOverlay uses to keep vanilla's reload timing whenever the
++// reload's completion reports a pack result (ServerboundResourcePackPacket) to a server.
+ package net.minecraft.client.resources.server;
+ 
+ import com.google.common.collect.Lists;
+@@ -298,6 +301,14 @@
+         }
+     }
+ 
++    /**
++     * W7: true while a server-pack (or singleplayer world-pack) reload's callbacks are pending, i.e. the next resource reload
++     * to complete calls {@link #onReloadSuccess} (or the recovery path) and thereby reports the pack result to the server.
++     */
++    public boolean serverPackReloadPending() {
++        return this.pendingReload != null;
++    }
++
+     public void onReloadSuccess() {
+         if (this.pendingReload != null) {
+             this.pendingReload.onSuccess();

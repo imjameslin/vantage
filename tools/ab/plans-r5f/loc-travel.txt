@@ -1,0 +1,18 @@
+# Travel regression localization (r5 vs r4 median -3.1%, 4/4 pairs): r4, r5z (= r4 + zoom), r5off (client-r5 with every
+# round-5 default off), r5 (shipped defaults); travel, 4 rounds rotated. tools/ab/scorecard.py, MEMLOG=1.
+travel r5f-loc-tr-r4-1 r4
+travel r5f-loc-tr-r5z-1 r5z
+travel r5f-loc-tr-r5off-1 r5off
+travel r5f-loc-tr-r5-1 r5
+travel r5f-loc-tr-r5-2 r5
+travel r5f-loc-tr-r5off-2 r5off
+travel r5f-loc-tr-r5z-2 r5z
+travel r5f-loc-tr-r4-2 r4
+travel r5f-loc-tr-r5z-3 r5z
+travel r5f-loc-tr-r4-3 r4
+travel r5f-loc-tr-r5-3 r5
+travel r5f-loc-tr-r5off-3 r5off
+travel r5f-loc-tr-r5off-4 r5off
+travel r5f-loc-tr-r5-4 r5
+travel r5f-loc-tr-r4-4 r4
+travel r5f-loc-tr-r5z-4 r5z
