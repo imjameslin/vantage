@@ -20,19 +20,36 @@ On an M5 MacBook at 3024 × 1964 with shaders and far terrain on, flying over ne
 
 ## Requirements
 
-- An Apple Silicon Mac with a recent macOS
-- Python 3 and the Xcode command line tools (`xcode-select --install`)
-- A Minecraft Java Edition account (needed to play; the build itself downloads the vanilla files from Mojang)
+- An Apple Silicon Mac on **macOS 26 or newer**
+- The Xcode command line tools (`xcode-select --install`; they include git, Python 3 and clang)
+- A Minecraft Java Edition account, and a launcher that can replace the game jar (for example
+  [Prism Launcher](https://prismlauncher.org))
 
-## Build
+You don't need to install Java: the setup downloads Mojang's own Java runtime along with the game.
+
+## Quick start
+
+There is no prebuilt download: the finished jar contains Minecraft's code, so you build it on your own Mac. The build
+downloads vanilla 26.3 from Mojang, decompiles it, applies `patches/` and compiles the result (a few minutes).
 
 ```sh
+git clone https://github.com/imjameslin/vantage.git
+cd vantage
 zsh setup.sh                 # downloads vanilla 26.3 from Mojang, decompiles it, applies patches/
 zsh tools/build-client.sh    # -> build/client.jar
 ```
 
-`build/client.jar` replaces the vanilla 26.3 client jar. In Prism Launcher, for example, create a 26.3 instance and add
-it under **Version → Replace Minecraft.jar**.
+Then play it in Prism Launcher:
+
+1. **Add Instance** → Minecraft **26.3** (no mod loader).
+2. **Edit** → **Version** → **Replace Minecraft.jar** → choose `build/client.jar`.
+3. Launch and log in as usual.
+4. Turn on **Video Settings → Shaders** and **Video Settings → Far Terrain**, then restart the game.
+
+To update: `git pull`, then `zsh setup.sh` (it reuses the download and decompile and only re-applies `patches/`) and
+`zsh tools/build-client.sh`, and replace the jar in the instance the same way.
+
+## Settings
 
 Two settings in **Video Settings** take effect the next time the game starts:
 
